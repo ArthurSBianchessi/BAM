@@ -31,6 +31,7 @@ from typing import (
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -38,7 +39,7 @@ import torch.distributed as dist
 
 ########################################################################################
 ########################################################################################
-from models.model import Transformer
+from models.model import Transformer, ModelArgs
 from functions import write_model, write_state, print0, DistributedShardedDataLoader
 ########################################################################################
 ########################################################################################
@@ -82,7 +83,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
     parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
-    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
+    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -147,12 +148,20 @@ if __name__ == "__main__":
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
 
-
     # init the model
-        model_config = {
-            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
-        }[args.model]
-        model = Transformer(model_config)
+    model_config = {
+        "l6": ModelArgs(dim=512, n_layers=6, n_heads=16, ffn_dim_multiplier=2),
+        "l8": ModelArgs(dim=768, n_layers=8, n_heads=16, ffn_dim_multiplier=2),
+        "l12": ModelArgs(dim=768, n_layers=12, n_heads=16, ffn_dim_multiplier=2),
+        "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
+        "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
+    }[args.model]
+    model = Transformer(model_config)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    embed_param_count = sum(p.numel() for p in model.tok_embeddings.parameters())
+    print0(f"Parameters:                    {param_count:,}")
+    print0(f"Non-Embedding Parameters:      {param_count - embed_param_count:,}")
     model.train()
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
@@ -172,22 +181,22 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
-    # do one forward pass to generate ground truth for our C tests
-    if master_process and args.write_tensors and (not args.inference_only):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
-        loss.backward()
-        # save model params, in bfloat16
-        model_to_size = {f"d{d}": f"d{d}" for d in [12, 24, 36, 48]}
+    # # do one forward pass to generate ground truth for our C tests
+    # if master_process and args.write_tensors and (not args.inference_only):
+    #     x, y = train_loader.next_batch()
+    #     x, y = x.to(device), y.to(device)
+    #     logits, loss = model(x, y)
+    #     loss.backward()
+    #     # save model params, in bfloat16
+    #     model_to_size = {f"l{l}": f"l{l}" for l in [12, 24, 36, 48]}
 
-        model_size_str = model_to_size[args.model]
-        write_model(model, os.path.join(args.output_dir, f"{args.model}.bin"), dtype=args.dtype)
-        # save x, y, logits, loss, and parameter gradients, for debugging C
-        # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"{args.model}_debug_state.bin"))
-        # reset the train_loader for the optimization below
-        train_loader.reset()
+    #     model_size_str = model_to_size[args.model]
+    #     write_model(model, os.path.join(args.output_dir, f"{args.model}.bin"), dtype=args.dtype)
+    #     # save x, y, logits, loss, and parameter gradients, for debugging C
+    #     # always store these in fp32 to have an accurate reference (?)
+    #     write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"{args.model}_debug_state.bin"))
+    #     # reset the train_loader for the optimization below
+    #     train_loader.reset()
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -195,12 +204,19 @@ if __name__ == "__main__":
     # here we wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
+    else:
+        model = model.to(device)
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
+    # optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
+    #                                            learning_rate=args.learning_rate, betas=(0.9, 0.95),
+    #                                            device_type=device, zero_stage=zero_stage)
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, 
+                                  betas=(0.9, 0.95), weight_decay=args.weight_decay,
+                                  fused=('fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda')
+    )
+
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -245,7 +261,8 @@ if __name__ == "__main__":
                 for _ in range(args.val_max_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
-                    _, loss = model(x, y, return_logits=False)
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
                     val_loss += loss.item()
                 val_loss /= args.val_max_steps
             # log to console and to file
@@ -308,7 +325,9 @@ if __name__ == "__main__":
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             # forward pass
             with ctx:
-                _, loss = model(x, y, return_logits=False)
+                # _, loss = model(x)
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
                 # we have to scale the loss to account for gradient accumulation,
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but

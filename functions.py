@@ -27,10 +27,10 @@ def _peek_data_shard(filename):
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240801:
+    if header[0] != 20240520:
         print("ERROR: magic number mismatch in the data .bin file!")
         exit(1)
-    assert header[1] == 7, "unsupported version"
+    assert header[1] == 1, "unsupported version"
     ntok = header[2] # number of tokens (claimed)
     return ntok # for now just return the number of tokens
 
@@ -38,11 +38,11 @@ def _load_data_shard(filename):
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240801, "magic number mismatch in the data .bin file"
-        assert header[1] == 7, "unsupported version"
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
         ntok = header[2] # number of tokens (claimed)
         # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint32)
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
 
