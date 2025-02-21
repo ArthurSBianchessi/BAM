@@ -40,7 +40,7 @@ import torch.distributed as dist
 ########################################################################################
 ########################################################################################
 from models.model import Transformer, ModelArgs
-from functions import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint
+from utils import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint
 ########################################################################################
 ########################################################################################
 
