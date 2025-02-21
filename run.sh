@@ -18,3 +18,4 @@ time torchrun --standalone --nproc_per_node 3 \
         --compile 1 \
         --tensorcores 1 \
         --dtype bfloat16 \
+        --val_loss_every 10 \

@@ -207,3 +207,15 @@ def print0(*args, **kwargs):
     # if this is not a distributed run, it's just a print
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
+
+
+def checkpoint(model, model_name='model', rank=None):
+    # state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+    state_dict = model.state_dict()
+    for k, v in state_dict.items():
+        state_dict[k] = v.cpu()
+    if rank is not None:
+        filename = f'checkpoints/{model_name}_{rank}.pt'
+    else:
+        filename=f'checkpoints/{model_name}.pt'
+    torch.save(state_dict, filename)

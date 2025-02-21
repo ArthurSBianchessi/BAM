@@ -40,7 +40,7 @@ import torch.distributed as dist
 ########################################################################################
 ########################################################################################
 from models.model import Transformer, ModelArgs
-from functions import write_model, write_state, print0, DistributedShardedDataLoader
+from functions import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint
 ########################################################################################
 ########################################################################################
 
@@ -254,6 +254,7 @@ if __name__ == "__main__":
             and (step % args.val_loss_every == 0 or last_step)) \
             and (val_loader is not None):
             model.eval()
+            checkpoint(model, rank=ddp_rank)
             val_loader.reset()
             with torch.no_grad():
                 val_loss = 0.0
