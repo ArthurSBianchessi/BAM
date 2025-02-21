@@ -160,9 +160,10 @@ if __name__ == "__main__":
 
     param_count = sum(p.numel() for p in model.parameters())
     embed_param_count = sum(p.numel() for p in model.tok_embeddings.parameters())
-    print0(f"Parameters:                    {param_count:,}")
-    print0(f"Non-Embedding Parameters:      {param_count - embed_param_count:,}")
+    print0(f"Parameters:                    {param_count:16,}")
+    print0(f"Non-Embedding Parameters:      {param_count - embed_param_count:16,}")
     model.train()
+    model = model.to(device)
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -204,8 +205,6 @@ if __name__ == "__main__":
     # here we wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
-    else:
-        model = model.to(device)
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer

@@ -72,7 +72,7 @@ class DistributedShardedDataLoader:
             assert shard_ntok >= num_processes * B * T + 1
             ntok_total += shard_ntok
         self.ntok_total = ntok_total
-        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+        print0(f"DataLoader: total number of tokens: {ntok_total:24,} across {len(self.files)} files")
 
         # kick things off
         self.current_shard = None
