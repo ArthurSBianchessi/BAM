@@ -40,7 +40,7 @@ import torch.distributed as dist
 ########################################################################################
 ########################################################################################
 from models.model import Transformer, ModelArgs
-from utils import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint
+from utils import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint, Logger
 ########################################################################################
 ########################################################################################
 
@@ -74,7 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
-    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
     # numerics
     parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
     # memory management
@@ -245,6 +245,7 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
+    logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, batch_size=args.total_batch_size)
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)
@@ -266,10 +267,7 @@ if __name__ == "__main__":
                     val_loss += loss.item()
                 val_loss /= args.val_max_steps
             # log to console and to file
-            print0(f"val loss {val_loss}")
-            if master_process and logfile is not None:
-                with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+            logger0.log_val(step, val_loss, 0)
 
         # once in a while perform model inference on the master process
         if (args.sample_every > 0 \
@@ -355,23 +353,10 @@ if __name__ == "__main__":
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
-        # time and print
-        t1 = time.time()
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
-        # log to logile
-        if master_process and logfile is not None:
-            with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
-
-        # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > args.num_iterations - 20:
-            timings.append(t1-t0)
-
-    # print the average of the last 20 timings, to get something smooth-ish
-    timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+        
+        # log
+        logger0.log(step, lossf, norm, lr)
+        
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------

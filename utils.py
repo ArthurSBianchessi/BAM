@@ -219,3 +219,51 @@ def checkpoint(model, model_name='model', rank=None):
     else:
         filename=f'checkpoints/{model_name}.pt'
     torch.save(state_dict, filename)
+
+
+class Logger:
+    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, batch_size=None):
+        assert model_type is not None
+        assert num_iterations is not None
+        assert batch_size is not None
+
+        self.log_dir = log_dir
+        self.num_iterations = num_iterations
+        self.batch_size = batch_size
+
+        self.train_log_file = f'{self.log_dir}/{model_type}_train.log'
+        with open(self.train_log_file, 'w') as f:
+            f.write(f'step,time,loss,norm,lr,tok/sec\n')
+
+        self.val_log_file = f'{self.log_dir}/{model_type}_val.log'
+        with open(self.val_log_file, 'w') as f:
+            f.write(f'step,time,loss,perplexity\n')
+        
+        self.log_init_time = time.time()
+        self.last_log_time = self.log_init_time
+
+        if rank==0:
+            self.is_main = True
+        else:
+            self.is_main = False
+
+
+    def log(self, step, loss, norm, lr):
+        if self.is_main:
+            runtime = time.time() - self.log_init_time
+            tokens_per_second = self.batch_size / (time.time() - self.last_log_time)
+            self.last_log_time = time.time()
+            string = f'{step},{runtime},{loss},{norm},{lr},{tokens_per_second}\n'
+            with open(self.train_log_file, 'a') as f:
+                f.write(string)
+            print(f"step {step+1:4d}/{self.num_iterations} | train loss {loss:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(runtime)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        
+    
+    def log_val(self, step, loss, perplexity):
+        if self.is_main:
+            runtime = time.time() - self.log_init_time
+            string = f'{step},{runtime},{loss},{perplexity}\n'
+            with open(self.val_log_file, 'a') as f:
+                f.write(string)
+            # print0(f"val loss {val_loss}")
+            print(f'val loss {loss:.6f} | perplexity {perplexity:.4f}')
