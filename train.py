@@ -208,14 +208,16 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    # optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-    #                                            learning_rate=args.learning_rate, betas=(0.9, 0.95),
-    #                                            device_type=device, zero_stage=zero_stage)
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, 
-                                  betas=(0.9, 0.95), weight_decay=args.weight_decay,
-                                  fused=('fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda')
-    )
-
+    # optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, 
+    #                               betas=(0.9, 0.95), weight_decay=args.weight_decay,
+    #                               fused=('fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda')
+    # )
+    param_dict = {pn: p for pn, p in model.module.named_parameters() if p.requires_grad}
+    optim_groups = [
+        {'params': [p for n, p in param_dict.items() if p.dim() >= 2], 'weight_decay': args.weight_decay},
+        {'params': [p for n, p in param_dict.items() if p.dim() < 2], 'weight_decay': 0.0}
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -245,7 +247,8 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, batch_size=args.total_batch_size)
+    logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, 
+                     batch_size=args.total_batch_size, model=model.module if ddp else model)
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)

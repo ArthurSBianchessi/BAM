@@ -19,6 +19,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 
+from torch.utils.data import IterableDataset
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
@@ -105,6 +109,91 @@ class DistributedShardedDataLoader:
             self.advance()
         return x, y
 
+class FineWebDistributedDataset(IterableDataset):
+    versions = {
+        '10B': 'sample-10BT',
+        '100B': 'sample-100BT',
+        '350B': 'sample-350BT',
+        'default': 'default',
+    }
+    def __init__(self, version, step_token_count, samples_per_fwd, rank=0, world_size=1, shard_size=128*27*5, max_length=1024,
+                 tokenizer="mistralai/Mistral-7B-Instruct-v0.3"):
+        self.dataset            = load_dataset("HuggingFaceFW/fineweb", name=self.versions[version])['train']
+        self.rank               = rank
+        self.world_size         = world_size
+        self.shard_size         = shard_size
+        self.max_length         = max_length
+        self.samples_per_fwd    = samples_per_fwd
+        self.step_token_count   = step_token_count
+
+        assert self.shard_size % self.samples_per_fwd == 0, "Shard size must be divisible by samples_per_fwd"
+
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        self.tokenizer.pad_token = self.tokenizer.unk_token
+
+        self.curr_pos = self.rank * self.shard_size
+        self.shard_pos = 0
+        # self.current_shard = self.tokenize(self.dataset[self.curr_pos:self.curr_pos+self.shard_size]['text'])
+        self.current_shard = self.tokenize_shard(self.curr_pos, self.curr_pos+self.shard_size)
+
+        self.stop = torch.tensor([0])
+        
+        self.is_ddp = torch.distributed.is_initialized() 
+
+    def next_shard(self):
+        self.curr_pos += self.shard_size*self.world_size
+        self.shard_pos = 0
+        start = self.curr_pos
+        end = self.curr_pos + self.shard_size
+        if end < len(self.dataset):
+            self.current_shard = self.tokenize_shard(start, end)
+        else:
+            self.stop[0] = 1
+    
+    def tokenize_shard(self, start, end):
+        return self.tokenizer(self.dataset[start:end]['text'], truncation=True, max_length=self.max_length, 
+                              return_length=True, padding=False, return_attention_mask=False)
+                              
+    def pad_token_ids(self, input_ids):
+        tokens = {'input_ids': input_ids}
+        return self.tokenizer.pad(tokens, return_tensors='pt')
+        
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        token_count = 0
+        lengths = self.current_shard['length'][self.shard_pos:]
+        batched_tokens = []
+        while token_count < self.step_token_count:
+            if self.shard_pos >= self.shard_size:
+                self.next_shard()
+            
+            if self.is_ddp:
+                dist.all_reduce(self.stop, op=dist.ReduceOp.MAX)
+            if self.stop[0]:
+                raise StopIteration
+            
+            batched_tokens.append(self.current_shard['input_ids'][self.shard_pos:self.shard_pos+self.samples_per_fwd])
+            self.shard_pos += self.samples_per_fwd
+            
+            # Syncronize the token_count
+            current_token_count = torch.tensor(sum(lengths[:self.shard_pos]))
+            if self.is_ddp:
+                dist.all_reduce(current_token_count, op=dist.ReduceOp.SUM)
+            token_count += current_token_count.item()
+
+        batches = []
+        for i in range(len(batched_tokens)):
+            # batched_tokens[i] = self.pad(batched_tokens[i])
+            targets = [input_id[1:]+[self.tokenizer.eos_token_id] for input_id in batched_tokens[i]]
+            # batched_targets.append(self.pad(targets))
+            batches.append((self.pad_token_ids(batched_tokens[i]), self.pad_token_ids(targets)))
+        return batches, token_count
+        
+
+                    
 # -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
 
@@ -222,7 +311,7 @@ def checkpoint(model, model_name='model', rank=None):
 
 
 class Logger:
-    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, batch_size=None):
+    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, batch_size=None, model=None):
         assert model_type is not None
         assert num_iterations is not None
         assert batch_size is not None
@@ -230,6 +319,8 @@ class Logger:
         self.log_dir = log_dir
         self.num_iterations = num_iterations
         self.batch_size = batch_size
+        self.rank = rank
+        self.model = model
 
         self.train_log_file = f'{self.log_dir}/{model_type}_train.log'
         with open(self.train_log_file, 'w') as f:
@@ -258,6 +349,10 @@ class Logger:
                 f.write(string)
             print(f"step {step+1:4d}/{self.num_iterations} | train loss {loss:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(runtime)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         
+        # checkpoint(self.model, rank=self.rank)
+        if step % 1000 == 0:
+            checkpoint(self.model, rank=self.rank)
+        
     
     def log_val(self, step, loss, perplexity):
         if self.is_main:
@@ -267,3 +362,4 @@ class Logger:
                 f.write(string)
             # print0(f"val loss {val_loss}")
             print(f'val loss {loss:.6f} | perplexity {perplexity:.4f}')
+            self.last_log_time = time.time()

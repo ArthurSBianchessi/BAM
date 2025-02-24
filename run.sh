@@ -3,13 +3,16 @@
         # --total_batch_size 524288 \
         # --total_batch_size 491520 \
         # --total_batch_size 983040 \
+        # --total_batch_size=589824 \
 
 # python \
+export NCCL_P2P_DISABLE=1
+export CUDA_VISIBLE_DEVICES=3,4,5
 time torchrun --standalone --nproc_per_node 3 \
     train.py \
         --input_bin="dev/data/fineweb10B/fineweb_train_*.bin" \
         --input_val_bin=dev/data/fineweb10B/fineweb_val_000000.bin \
-        --total_batch_size=491520 \
+        --total_batch_size=589824 \
         --sequence_length=1024 \
         --batch_size=32 \
         --weight_decay=0.1  \
