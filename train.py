@@ -40,7 +40,7 @@ import torch.distributed as dist
 ########################################################################################
 ########################################################################################
 from models.model import Transformer, ModelArgs
-from utils import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint, Logger
+from utils import print0, Logger, FineWebDistributedDataset
 ########################################################################################
 ########################################################################################
 
@@ -54,7 +54,6 @@ if __name__ == "__main__":
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
-    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="l6", help="l6|l8|l12|l16|l24|l32")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
@@ -71,19 +70,18 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
-    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--val_samples", type=int, default=1536, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
     # numerics
-    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    parser.add_argument("--tensorcores", type=int, default=1, help="use tensorcores")
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
-    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--compile", type=int, default=1, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
-    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
     # python -> C bridge
-    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
+    parser.add_argument("--checkpoint_every", type=int, default=0, help="write tensors to disk")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -105,11 +103,9 @@ if __name__ == "__main__":
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
         seed_offset = 0 # each process gets the exact same seed
-        zero_stage = args.zero_stage
     else:
         ddp_rank = 0
         ddp_local_rank = 0
-        zero_stage = 0
         ddp_world_size = 1
         master_process = True
         seed_offset = 0
@@ -129,7 +125,7 @@ if __name__ == "__main__":
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
-    assert args.total_batch_size % tokens_per_fwdbwd == 0
+    # assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {args.total_batch_size}")
     print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
@@ -150,12 +146,15 @@ if __name__ == "__main__":
 
     # init the model
     model_config = {
-        "l6": ModelArgs(dim=512, n_layers=6, n_heads=16, ffn_dim_multiplier=2),
-        "l8": ModelArgs(dim=768, n_layers=8, n_heads=16, ffn_dim_multiplier=2),
-        "l12": ModelArgs(dim=768, n_layers=12, n_heads=16, ffn_dim_multiplier=2),
-        "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
-        "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
+        "l6": ModelArgs(dim=512, n_layers=6, n_heads=16),
+        "l8": ModelArgs(dim=768, n_layers=8, n_heads=16),
+        "l12": ModelArgs(dim=768, n_layers=12, n_heads=16),
+        "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16),
+        "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16),
     }[args.model]
+    model_config.max_batch_size = args.batch_size
+    model_config.max_sequence_length = args.sequence_length
+    model_config.ffn_dim_multiplier = 2
     model = Transformer(model_config)
 
     param_count = sum(p.numel() for p in model.parameters())
@@ -174,30 +173,21 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    if args.input_val_bin:
-        val_loader = DistributedShardedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    # train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    # val_loader = None
+    # if args.input_val_bin:
+    #     val_loader = DistributedShardedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    train_dataset = FineWebDistributedDataset('10B', args.total_batch_size, args.batch_size, rank=ddp_rank, 
+                                              world_size=ddp_world_size, max_length=args.sequence_length, val_samples=args.val_samples)
+    train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=1, pin_memory=True, pin_memory_device=device, prefetch_factor=32)
+    train_loader = torch.utils.data.DataLoader(train_dataset)
 
-    # -------------------------------------------------------------------------
-    # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
-    # # do one forward pass to generate ground truth for our C tests
-    # if master_process and args.write_tensors and (not args.inference_only):
-    #     x, y = train_loader.next_batch()
-    #     x, y = x.to(device), y.to(device)
-    #     logits, loss = model(x, y)
-    #     loss.backward()
-    #     # save model params, in bfloat16
-    #     model_to_size = {f"l{l}": f"l{l}" for l in [12, 24, 36, 48]}
-
-    #     model_size_str = model_to_size[args.model]
-    #     write_model(model, os.path.join(args.output_dir, f"{args.model}.bin"), dtype=args.dtype)
-    #     # save x, y, logits, loss, and parameter gradients, for debugging C
-    #     # always store these in fp32 to have an accurate reference (?)
-    #     write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"{args.model}_debug_state.bin"))
-    #     # reset the train_loader for the optimization below
-    #     train_loader.reset()
+    if args.val_samples:
+        val_batches, val_token_count = train_dataset.get_val_batches()
+    else:
+        val_batches, val_token_count = None, None
+    # raise Exception('Stop here')
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -208,16 +198,16 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
-    # optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, 
-    #                               betas=(0.9, 0.95), weight_decay=args.weight_decay,
-    #                               fused=('fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda')
-    # )
-    param_dict = {pn: p for pn, p in model.module.named_parameters() if p.requires_grad}
+    param_dict = {pn: p for pn, p in raw_model.named_parameters() if p.requires_grad}
     optim_groups = [
         {'params': [p for n, p in param_dict.items() if p.dim() >= 2], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in param_dict.items() if p.dim() < 2], 'weight_decay': 0.0}
     ]
-    optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    use_fused = 'fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda'
+    optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), 
+                                  weight_decay=args.weight_decay, fused=use_fused)
+    
+    criteria = torch.nn.CrossEntropyLoss(reduction='none')
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -234,43 +224,53 @@ if __name__ == "__main__":
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
         return min_lr + coeff * (args.learning_rate - min_lr)
 
-    # create the logging directory if it does not exist
-    logfile = None
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "main.log")
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
-
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
     logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, 
                      batch_size=args.total_batch_size, model=model.module if ddp else model)
-    for step in range(args.num_iterations + 1):
-        t0 = time.time()
+    # for step in range(args.num_iterations + 1):
+    # for step, (batches, token_count) in enumerate(train_dataset):
+    for step, (batches, token_count) in enumerate(train_loader):
         last_step = (step == args.num_iterations)
+
+        # if ddp:
+        #     token_count = current_token_count.cuda()
+        #     dist.all_reduce(current_token_count, op=dist.ReduceOp.SUM)
+        #     current_token_count = current_token_count.cpu()
 
         # once in a while evaluate the validation dataset
         if (args.val_loss_every > 0 \
             and (step % args.val_loss_every == 0 or last_step)) \
-            and (val_loader is not None):
+            and (val_batches is not None):
             model.eval()
-            checkpoint(model, rank=ddp_rank)
-            val_loader.reset()
+            # val_loader.reset()
             with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(args.val_max_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                val_loss = torch.tensor(0.0) if not ddp else torch.tensor(0.0, device=device)
+                # for _ in range(args.val_max_steps):
+                for inputs, targets in val_batches:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    logits = model(**inputs)
+                    # logits *= inputs['attention_mask'].unsqueeze(-1)
+                    # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                    loss = criteria(logits.view(-1, logits.size(-1)), targets.view(-1))
+                    # print0()
+                    # print0(logits.sum())
+                    # print0(targets.sum())
+                    # print0(loss)
+                    # print0(loss * inputs['attention_mask'].view(-1))
+                    # print0()
+                    # print0()
+                    # raise Exception('Stop here')
+
+                    loss = (loss * inputs['attention_mask'].view(-1)).sum()/val_token_count
                     val_loss += loss.item()
-                val_loss /= args.val_max_steps
+                # val_loss /= val_token_count
+                if ddp:
+                    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
             # log to console and to file
-            logger0.log_val(step, val_loss, 0)
+            logger0.log_val(step, val_loss.item(), 0)
 
         # once in a while perform model inference on the master process
         if (args.sample_every > 0 \
@@ -309,37 +309,45 @@ if __name__ == "__main__":
 
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
-        optimizer.zero_grad(set_to_none=True)
-        # if we are trying to overfit a single batch, we reset the loader here
-        if args.overfit_single_batch:
-            train_loader.reset()
+        optimizer.zero_grad()
+        # # if we are trying to overfit a single batch, we reset the loader here
+        # if args.overfit_single_batch:
+        #     train_loader.reset()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
-        for micro_step in range(grad_accum_steps):
+        # for micro_step in range(grad_accum_steps):
+        num_batches = len(batches)
+        for micro_step, (inputs, targets) in enumerate(batches):
             # fetch a batch
-            x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
+            # x, y = x.to(device), y.to(device)
+            inputs, targets = inputs.to(device), targets.to(device)
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
                 # the official way to do this is with model.no_sync(), but that is a
                 # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+                model.require_backward_grad_sync = (micro_step == num_batches - 1)
             # forward pass
             with ctx:
                 # _, loss = model(x)
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                inputs['input_ids'] = inputs['input_ids'][0]
+                logits = model(**inputs)
+                # logits *= inputs['attention_mask'].unsqueeze(-1)
+                # loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                loss = criteria(logits.view(-1, logits.size(-1)), targets.view(-1))
+                loss = (loss * inputs['attention_mask'].view(-1)).sum()
                 # we have to scale the loss to account for gradient accumulation,
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but
                 # instead of a SUM we want MEAN, so we scale the loss here
-                loss = loss / grad_accum_steps
+                # loss = loss / grad_accum_steps
+                # lossf += loss.detach() # keep track of the mean loss
                 lossf += loss.detach() # keep track of the mean loss
+                loss = loss / inputs['attention_mask'].sum()
             # backward pass
             if not args.inference_only:
                 loss.backward()
-        if ddp:
-            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
+        # if ddp:
+        #     dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         # determine and set the learning rate for this iteration
@@ -358,7 +366,7 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         
         # log
-        logger0.log(step, lossf, norm, lr)
+        logger0.log(step, lossf, norm, lr, token_count)
         
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 

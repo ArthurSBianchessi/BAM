@@ -217,7 +217,10 @@ if __name__ == "__main__":
         {'params': [p for n, p in param_dict.items() if p.dim() >= 2], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in param_dict.items() if p.dim() < 2], 'weight_decay': 0.0}
     ]
-    optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+
+    use_fused = 'fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda'
+    optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), 
+                                  weight_decay=args.weight_decay, fused=use_fused)
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):

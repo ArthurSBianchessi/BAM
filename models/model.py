@@ -232,28 +232,59 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        self.register_buffer('mask', torch.full((params.max_batch_size,params.max_seq_len, params.max_seq_len), float('-inf')))
+        self.register_buffer('causal_mask', torch.tril(torch.ones(params.max_batch_size,params.max_seq_len, params.max_seq_len), diagonal=0).bool())
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, start_pos: int = 0):
+        # print()
+        # print(input_ids.shape)
+        # print(input_ids.sum(0))
+        # print()
+
+        _bsz, seqlen = input_ids.shape
+        h = self.tok_embeddings(input_ids)
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+        # attention_mask = attention_mask.unsqueeze(-2) & attention_mask.unsqueeze(-1)
+        # mask = torch.full((1,seqlen, seqlen), float('-inf'), device=input_ids.device)
+        # mask = torch.tril(torch.ones(1,seqlen, seqlen), diagonal=0)
+        bool_mask = self.causal_mask[:,-seqlen:,-seqlen:]
+        if attention_mask is not None:
+            attention_mask = attention_mask.bool()
+            bool_mask = bool_mask&attention_mask.unsqueeze(-2)
+            bool_mask = bool_mask|(~attention_mask.unsqueeze(-1))
 
-            mask = torch.triu(mask, diagonal=1)
+            # mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
+            # attention_mask = attention_mask.bool().unsqueeze(-2).repeat(1,seqlen,1)
+            # mask[~attention_mask.bool().unsqueeze(-2).repeat(1,seqlen,1)] = float('-inf')
+            # mask[~attention_mask.bool().unsqueeze(-1).repeat(1,1,seqlen)] = 0
+            # print(mask.shape)
+            # print(mask.device)
+            # print(attention_mask.shape)
+            # print(attention_mask.device)
+        # mask = mask.type_as(h)
+        mask = self.mask[:,:seqlen,:seqlen].type_as(h)
+        # mask[bool_mask] = 0
+        mask = mask.masked_fill(bool_mask, 0)
+        mask = mask.detach()
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
+        # mask = None
+        # if seqlen > 1:
+        #     mask = torch.full((seqlen, seqlen), float("-inf"), device=input_ids.device)
+
+        #     mask = torch.triu(mask, diagonal=1)
+
+        #     # When performing key-value caching, we compute the attention scores
+        #     # only for the new sequence. Thus, the matrix of scores is of size
+        #     # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+        #     # j > cache_len + i, since row i corresponds to token cache_len + i.
+        #     mask = torch.hstack(
+        #         [torch.zeros((seqlen, start_pos), device=input_ids.device), mask]
+        #     ).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask.unsqueeze(-3))
         h = self.norm(h)
         output = self.output(h).float()
         return output
