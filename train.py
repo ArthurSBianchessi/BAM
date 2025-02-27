@@ -40,7 +40,7 @@ import torch.distributed as dist
 ########################################################################################
 ########################################################################################
 from models.model import Transformer, ModelArgs
-from utils import write_model, write_state, print0, DistributedShardedDataLoader, checkpoint, Logger
+from utils import write_model, write_state, print0, DistributedShardedDataset, checkpoint, Logger
 ########################################################################################
 ########################################################################################
 
@@ -174,10 +174,11 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_dataset = DistributedShardedDataset(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_loader = iter(train_dataset)
     val_loader = None
     if args.input_val_bin:
-        val_loader = DistributedShardedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+        val_loader = DistributedShardedDataset(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
@@ -317,7 +318,8 @@ if __name__ == "__main__":
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step in range(grad_accum_steps):
             # fetch a batch
-            x, y = train_loader.next_batch()
+            # x, y = train_loader.next_batch()
+            x, y = next(train_loader)
             x, y = x.to(device), y.to(device)
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model

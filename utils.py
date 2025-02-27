@@ -26,7 +26,7 @@ from transformers import AutoTokenizer
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
 
-class DistributedShardedDataLoader:
+class DistributedShardedDataset(IterableDataset):
     """
     This DataLoader is both:
     - distributed (works correctly in case of multiple processes in DDP)
@@ -40,6 +40,7 @@ class DistributedShardedDataLoader:
         self.num_processes  = num_processes
         self.batch_size     = batch_size
         self.seq_len        = seq_len
+        self.tokens_per_fwd = batch_size * seq_len
 
         # glob files that match the pattern
         self.files = sorted(os.listdir(f"data/{dataset_dir}"))
@@ -47,7 +48,7 @@ class DistributedShardedDataLoader:
         assert len(self.files) > 0, f"did not find any files that match the pattern {dataset_dir}"
 
         # load and validate all data shards, count number of tokens in total
-        print(f"Dataset: loading {len(self.files)} files")
+        print0(f"Dataset: loading {len(self.files)} files")
         ntok_total = 0
         for fname in self.files:
             shard_ntok = self.load_data_shard(fname).size(0)
@@ -61,34 +62,40 @@ class DistributedShardedDataLoader:
         self.reset()
 
     def reset(self):
-        # we're being a bit clever here: if we already had shard 0 loaded,
-        # then don't do the work to reload it, just reset the pointer
         if self.current_shard != 0:
             self.current_shard = 0
             self.tokens = self.load_data_shard(self.files[self.current_shard])
         self.current_position = self.process_rank * self.batch_size * self.seq_len
-
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.batch_size * self.seq_len
-        self.tokens = self.load_data_shard(self.files[self.current_shard])
-
-    def next_batch(self):
-        buf = self.tokens[self.current_position : self.current_position+self.batch_size*self.seq_len+1]
-        buf = torch.tensor(buf, dtype=torch.long)
-        x = (buf[:-1]).view(self.batch_size, self.seq_len) # inputs
-        y = (buf[1:]).view(self.batch_size, self.seq_len) # targets
-        # advance the start pointer in current shard
-        self.current_position += self.batch_size * self.seq_len * self.num_processes
-        # if loading the next batch would be out of bounds advance the shard
-        if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x, y
     
     def load_data_shard(self, filename):
         dataset = torch.load(filename)
         return dataset['input_ids']
     
+    def __iter__(self):
+        self.reset()
+        return self
+    
+    def __next__(self):
+        tokens = self.tokens[self.current_position : self.current_position+self.batch_size*self.seq_len+1].long()
+        x = (tokens[:-1]).view(self.batch_size, self.seq_len) # inputs
+        y = (tokens[1:]).view(self.batch_size, self.seq_len) # targets
+        # advance the start pointer in current shard
+        self.current_position += self.batch_size * self.seq_len * self.num_processes
+        # if loading the next batch would be out of bounds advance the shard
+        if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.tokens):
+            self.advance_shard()
+        return x, y
+    
+    def advance_shard(self):
+        self.current_shard = (self.current_shard + 1)
+        if self.current_shard > len(self.files):
+            raise StopIteration
+        self.current_position = self.process_rank * self.batch_size * self.seq_len
+
+        self.tokens = self.tokens[self.current_position:]
+        new_tokens = self.load_data_shard(self.files[self.current_shard])
+        self.tokens = torch.concat([self.tokens, new_tokens], dim=0)
+
     
 
                     
