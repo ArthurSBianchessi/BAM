@@ -174,8 +174,10 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_dataset = DistributedShardedDataset(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    train_loader = iter(train_dataset)
+    train_dataset = DistributedShardedDataset(args.input_bin, B, T, ddp_rank, ddp_world_size, grad_accum_steps)
+    # train_loader = iter(train_dataset)
+    # train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=None)
+    train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=1, batch_size=None, prefetch_factor=4, pin_memory=True, pin_memory_device=device)
     val_loader = None
     if args.input_val_bin:
         val_loader = DistributedShardedDataset(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
@@ -250,7 +252,8 @@ if __name__ == "__main__":
     norm = -1.0   # dummy value to print in inference-only mode
     logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, 
                      batch_size=args.total_batch_size, model=model.module if ddp else model)
-    for step in range(args.num_iterations + 1):
+    # for step in range(args.num_iterations + 1):
+    for step, batches in enumerate(train_loader):
         t0 = time.time()
         last_step = (step == args.num_iterations)
 
@@ -316,10 +319,10 @@ if __name__ == "__main__":
             train_loader.reset()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
-        for micro_step in range(grad_accum_steps):
+        for micro_step, (x, y) in enumerate(batches):
+        # for micro_step in range(grad_accum_steps):
             # fetch a batch
             # x, y = train_loader.next_batch()
-            x, y = next(train_loader)
             x, y = x.to(device), y.to(device)
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model

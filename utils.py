@@ -35,27 +35,28 @@ class DistributedShardedDataset(IterableDataset):
     of the dataset on disk, so the user should make sure to shuffle their examples
     during the creation of their data shards for best performance.
     """
-    def __init__(self, dataset_dir, batch_size, seq_len, process_rank, num_processes):
+    def __init__(self, dataset_dir, batch_size, seq_len, process_rank, num_processes, gradient_accumulation_steps):
         self.process_rank   = process_rank
         self.num_processes  = num_processes
         self.batch_size     = batch_size
         self.seq_len        = seq_len
         self.tokens_per_fwd = batch_size * seq_len
+        self.gradient_accumulation_steps = gradient_accumulation_steps
 
         # glob files that match the pattern
         self.files = sorted(os.listdir(f"data/{dataset_dir}"))
         self.files = [f"data/{dataset_dir}/{f}" for f in self.files]
         assert len(self.files) > 0, f"did not find any files that match the pattern {dataset_dir}"
 
-        # load and validate all data shards, count number of tokens in total
-        print0(f"Dataset: loading {len(self.files)} files")
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = self.load_data_shard(fname).size(0)
-            assert shard_ntok > num_processes * batch_size * seq_len
-            ntok_total += shard_ntok
-        self.ntok_total = ntok_total
-        print0(f"Dataset: total number of tokens: {ntok_total:24,} across {len(self.files)} files")
+        # # load and validate all data shards, count number of tokens in total
+        # print0(f"Dataset: loading {len(self.files)} files")
+        # ntok_total = 0
+        # for fname in self.files:
+        #     shard_ntok = self.load_data_shard(fname).size(0)
+        #     assert shard_ntok > num_processes * batch_size * seq_len
+        #     ntok_total += shard_ntok
+        # self.ntok_total = ntok_total
+        # print0(f"Dataset: total number of tokens: {ntok_total:24,} across {len(self.files)} files")
 
         # kick things off
         self.current_shard = None
@@ -76,15 +77,21 @@ class DistributedShardedDataset(IterableDataset):
         return self
     
     def __next__(self):
-        tokens = self.tokens[self.current_position : self.current_position+self.batch_size*self.seq_len+1].long()
-        x = (tokens[:-1]).view(self.batch_size, self.seq_len) # inputs
-        y = (tokens[1:]).view(self.batch_size, self.seq_len) # targets
-        # advance the start pointer in current shard
-        self.current_position += self.batch_size * self.seq_len * self.num_processes
-        # if loading the next batch would be out of bounds advance the shard
-        if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.tokens):
-            self.advance_shard()
-        return x, y
+        batches = []
+        for i in range(self.gradient_accumulation_steps):
+            tokens = self.tokens[self.current_position : self.current_position+self.batch_size*self.seq_len+1].long()
+            x = (tokens[:-1]).view(self.batch_size, self.seq_len) # inputs
+            y = (tokens[1:]).view(self.batch_size, self.seq_len) # targets
+            # batches.append((x, y))
+            batches.append(torch.stack((x, y)))
+
+            # advance the start pointer in current shard
+            self.current_position += self.batch_size * self.seq_len * self.num_processes
+            # if loading the next batch would be out of bounds advance the shard
+            if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.tokens):
+                self.advance_shard()
+        return torch.stack(batches)
+        # return batches
     
     def advance_shard(self):
         self.current_shard = (self.current_shard + 1)
