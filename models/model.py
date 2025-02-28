@@ -96,18 +96,18 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.register_buffer('cache_k', torch.zeros((
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-        )), persistent=False)
-        self.register_buffer('cache_v', torch.zeros((
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-        )), persistent=False)
+        # self.register_buffer('cache_k', torch.zeros((
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        # )), persistent=False)
+        # self.register_buffer('cache_v', torch.zeros((
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        # )), persistent=False)
 
 
     def forward(
@@ -232,7 +232,7 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -244,13 +244,21 @@ class Transformer(nn.Module):
 
             mask = torch.triu(mask, diagonal=1)
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
+            if seq_codes is not None:
+                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
+                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
+                mask[section_mask] = float("-inf")
+                mask = mask.unsqueeze(-3)
+                
+
+            # # When performing key-value caching, we compute the attention scores
+            # # only for the new sequence. Thus, the matrix of scores is of size
+            # # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # # j > cache_len + i, since row i corresponds to token cache_len + i.
+            # mask = torch.hstack(
+            #     [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            # ).type_as(h)
+            mask = mask.type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)

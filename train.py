@@ -54,12 +54,12 @@ if __name__ == "__main__":
     # file system input / output
     parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
-    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
+    parser.add_argument("--log_dir", type=str, default="logs", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="l6", help="l6|l8|l12|l16|l24|l32")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    parser.add_argument("--aprox_tokens_per_step", type=int, default=500_000, help="approximate tokens per step")
     # workload (number of steps)
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
@@ -87,8 +87,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # args error checking and convenience variables
-    B, T = args.batch_size, args.sequence_length
-    assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
+    batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model in {"l6", "l8", "l12", "l16", "l24", "l32"}
 
@@ -128,11 +127,15 @@ if __name__ == "__main__":
     device_type = 'cuda' if 'cuda' in device else 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
-    tokens_per_fwdbwd = B * T * ddp_world_size
-    assert args.total_batch_size % tokens_per_fwdbwd == 0
-    grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
-    print0(f"total desired batch size: {args.total_batch_size}")
-    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    tokens_per_fwdbwd = int(batch_size * seq_len * ddp_world_size)
+    grad_accum_steps = args.aprox_tokens_per_step / tokens_per_fwdbwd
+    if grad_accum_steps % 1 != 0:
+        grad_accum_steps = grad_accum_steps + 1
+    grad_accum_steps = int(grad_accum_steps)
+    tokens_per_batch = tokens_per_fwdbwd * grad_accum_steps
+    print0(f"Tokens per Forward Pass:                       {tokens_per_fwdbwd:16,}")
+    print0(f"Tokens per Batch:                              {tokens_per_batch:16,}")
+    print0(f"=> calculated gradient accumulation steps:     {grad_accum_steps:16,}")
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
@@ -160,27 +163,29 @@ if __name__ == "__main__":
 
     param_count = sum(p.numel() for p in model.parameters())
     embed_param_count = sum(p.numel() for p in model.tok_embeddings.parameters())
-    print0(f"Parameters:                    {param_count:16,}")
-    print0(f"Non-Embedding Parameters:      {param_count - embed_param_count:16,}")
+    print0()
+    print0(f"Parameters:                                    {param_count:16,}")
+    print0(f"Non-Embedding Parameters:                      {param_count - embed_param_count:16,}")
+    print0()
     model.train()
     model = model.to(device)
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True # suggested by @Chillee
-        print0("compiling the model...")
+        print0("Compiling the Model...")
         model = torch.compile(model)
 
     # -------------------------------------------------------------------------
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_dataset = DistributedShardedDataset(args.input_bin, B, T, ddp_rank, ddp_world_size, grad_accum_steps)
+    train_dataset = DistributedShardedDataset(args.input_bin, batch_size, seq_len, ddp_rank, ddp_world_size, grad_accum_steps)
     # train_loader = iter(train_dataset)
     # train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=None)
     train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=1, batch_size=None, prefetch_factor=4, pin_memory=True, pin_memory_device=device)
     val_loader = None
     if args.input_val_bin:
-        val_loader = DistributedShardedDataset(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+        val_loader = DistributedShardedDataset(args.input_val_bin, batch_size, seq_len, ddp_rank, ddp_world_size)
 
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
@@ -239,9 +244,9 @@ if __name__ == "__main__":
 
     # create the logging directory if it does not exist
     logfile = None
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "main.log")
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
+        logfile = os.path.join(args.log_dir, "main.log")
         # create the log file "main.log" inside it, and wipe it clean
         with open(logfile, "w") as f:
             pass
@@ -251,7 +256,7 @@ if __name__ == "__main__":
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
     logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, 
-                     batch_size=args.total_batch_size, model=model.module if ddp else model)
+                     tokens_per_batch=tokens_per_batch, model=model.module if ddp else model)
     # for step in range(args.num_iterations + 1):
     for step, batches in enumerate(train_loader):
         t0 = time.time()
@@ -319,11 +324,12 @@ if __name__ == "__main__":
             train_loader.reset()
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
-        for micro_step, (x, y) in enumerate(batches):
+        for micro_step, (input_ids, seq_codes, targets) in enumerate(batches):
         # for micro_step in range(grad_accum_steps):
             # fetch a batch
             # x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
+            input_ids, seq_codes, targets = input_ids.to(device), seq_codes.to(device), targets.to(device)
+            # input_ids, targets = input_ids.to(device), targets.to(device)
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
                 # the official way to do this is with model.no_sync(), but that is a
@@ -332,8 +338,9 @@ if __name__ == "__main__":
             # forward pass
             with ctx:
                 # _, loss = model(x)
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                # logits = model(input_ids)
+                logits = model(input_ids, seq_codes=seq_codes)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
                 # we have to scale the loss to account for gradient accumulation,
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but
@@ -365,7 +372,7 @@ if __name__ == "__main__":
         # log
         logger0.log(step, lossf, norm, lr)
         
-    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    print0(f"peak memory consumption:                       {torch.cuda.max_memory_allocated() // 1024 / 1024:16,.2} MiB")
 
     # -------------------------------------------------------------------------
     # clean up nice

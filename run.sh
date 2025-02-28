@@ -9,20 +9,19 @@
 
 # python \
 export NCCL_P2P_DISABLE=1
-export CUDA_VISIBLE_DEVICES=0,2,3,4,5
+export CUDA_VISIBLE_DEVICES=1,2,3,4,5
+# export CUDA_VISIBLE_DEVICES=3,4,5
 time torchrun --standalone --nproc_per_node 5 \
     train.py \
         --input_bin="10B" \
-        --total_batch_size=491520 \
         --sequence_length=1024 \
-        --batch_size=32 \
+        --batch_size=24 \
         --weight_decay=0.1  \
         --num_iterations=20000 \
         --model=l6 \
         --warmup_iters=400 \
         --learning_rate_decay_frac=0.1 \
-        --output_dir=logs \
         --compile=1 \
         --tensorcores=1 \
-        --dtype=bfloat16 \
         --val_loss_every=10 \
+        --dtype=bfloat16 \

@@ -65,33 +65,50 @@ class DistributedShardedDataset(IterableDataset):
     def reset(self):
         if self.current_shard != 0:
             self.current_shard = 0
-            self.tokens = self.load_data_shard(self.files[self.current_shard])
+            self.input_ids, self.seq_codes = self.load_data_shard(self.files[self.current_shard])
         self.current_position = self.process_rank * self.batch_size * self.seq_len
     
     def load_data_shard(self, filename):
         dataset = torch.load(filename)
-        return dataset['input_ids']
+        return dataset['input_ids'], dataset['seq_codes']
     
     def __iter__(self):
         self.reset()
         return self
     
     def __next__(self):
-        batches = []
+        # inputs = torch.empty((self.gradient_accumulation_steps, self.batch_size, self.seq_len), dtype=torch.int64)
+        # seq_codes = torch.empty((self.gradient_accumulation_steps, self.batch_size, self.seq_len), dtype=torch.int64)
+        # targets = torch.empty((self.gradient_accumulation_steps, self.batch_size, self.seq_len), dtype=torch.int64)
+        
+        batches = torch.empty((self.gradient_accumulation_steps, 3, self.batch_size, self.seq_len), dtype=torch.int64)
         for i in range(self.gradient_accumulation_steps):
-            tokens = self.tokens[self.current_position : self.current_position+self.batch_size*self.seq_len+1].long()
-            x = (tokens[:-1]).view(self.batch_size, self.seq_len) # inputs
-            y = (tokens[1:]).view(self.batch_size, self.seq_len) # targets
+            input_ids = self.input_ids[self.current_position : self.current_position+self.batch_size*self.seq_len+1].long()
+            seq_codes = self.seq_codes[self.current_position : self.current_position+self.batch_size*self.seq_len].long()
+
+            input       = input_ids[:-1].view(self.batch_size, self.seq_len) 
+            targets     = input_ids[1:].view(self.batch_size, self.seq_len)
+            seq_codes   = seq_codes.view(self.batch_size, self.seq_len)
+            
+            batches[i, 0] = input
+            batches[i, 1] = seq_codes
+            batches[i, 2] = targets
+            # batches[i] = torch.stack((input, seq_codes, targets))
             # batches.append((x, y))
-            batches.append(torch.stack((x, y)))
+            # batches.append((input, seq_codes, targets))
+            # batches.append(torch.stack((x, y)))
+            # batches.append({
+            #     'input_ids': input,
+            #     'seq_codes': seq_codes[:-1],
+            #     'labels': targets,
+            # })
 
             # advance the start pointer in current shard
             self.current_position += self.batch_size * self.seq_len * self.num_processes
             # if loading the next batch would be out of bounds advance the shard
-            if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.tokens):
+            if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.input_ids):
                 self.advance_shard()
-        return torch.stack(batches)
-        # return batches
+        return batches
     
     def advance_shard(self):
         self.current_shard = (self.current_shard + 1)
@@ -99,9 +116,12 @@ class DistributedShardedDataset(IterableDataset):
             raise StopIteration
         self.current_position = self.process_rank * self.batch_size * self.seq_len
 
-        self.tokens = self.tokens[self.current_position:]
-        new_tokens = self.load_data_shard(self.files[self.current_shard])
-        self.tokens = torch.concat([self.tokens, new_tokens], dim=0)
+        self.input_ids = self.input_ids[self.current_position:]
+        self.seq_codes = self.seq_codes[self.current_position:]
+
+        new_input_ids, new_seq_codes = self.load_data_shard(self.files[self.current_shard])
+        self.input_ids = torch.cat([self.input_ids, new_input_ids], dim=0)
+        self.seq_codes = torch.cat([self.seq_codes, new_seq_codes], dim=0)
 
     
 
@@ -223,14 +243,14 @@ def checkpoint(model, model_name='model', rank=None):
 
 
 class Logger:
-    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, batch_size=None, model=None):
+    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, tokens_per_batch=None, model=None):
         assert model_type is not None
         assert num_iterations is not None
-        assert batch_size is not None
+        assert tokens_per_batch is not None
 
         self.log_dir = log_dir
         self.num_iterations = num_iterations
-        self.batch_size = batch_size
+        self.tokens_per_batch = tokens_per_batch
         self.rank = rank
         self.model = model
 
@@ -254,7 +274,7 @@ class Logger:
     def log(self, step, loss, norm, lr):
         if self.is_main:
             runtime = time.time() - self.log_init_time
-            tokens_per_second = self.batch_size / (time.time() - self.last_log_time)
+            tokens_per_second = self.tokens_per_batch / (time.time() - self.last_log_time)
             self.last_log_time = time.time()
             string = f'{step},{runtime},{loss},{norm},{lr},{tokens_per_second}\n'
             with open(self.train_log_file, 'a') as f:
