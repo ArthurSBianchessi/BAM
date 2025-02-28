@@ -35,38 +35,52 @@ class DistributedShardedDataset(IterableDataset):
     of the dataset on disk, so the user should make sure to shuffle their examples
     during the creation of their data shards for best performance.
     """
-    def __init__(self, dataset_dir, batch_size, seq_len, process_rank, num_processes, gradient_accumulation_steps):
-        self.process_rank   = process_rank
-        self.num_processes  = num_processes
-        self.batch_size     = batch_size
-        self.seq_len        = seq_len
-        self.tokens_per_fwd = batch_size * seq_len
-        self.gradient_accumulation_steps = gradient_accumulation_steps
+    def __init__(self, dataset_dir, batch_size, seq_len, process_rank, num_processes, 
+                 grad_accum_steps, min_val_tokens=0, val_tokens_padding=10**6):
+        self.process_rank       = process_rank
+        self.num_processes      = num_processes
+        self.batch_size         = batch_size
+        self.seq_len            = seq_len
+        self.tokens_per_batch   = batch_size * seq_len * num_processes
+        self.tokens_per_fwd     = batch_size * seq_len
+        self.grad_accum_steps   = grad_accum_steps
+
+
+        self.val_tokens_padding = val_tokens_padding if min_val_tokens > 0 else 0
+        self.val_tokens = round_to_multiple(min_val_tokens, multiple=self.tokens_per_batch, up=True)
+        print0(f'Valiation tokens:                              {self.val_tokens:16,}')
+        print0(f'Valiation tokens padding:                      {self.val_tokens_padding:16,}')
+
 
         # glob files that match the pattern
         self.files = sorted(os.listdir(f"data/{dataset_dir}"))
         self.files = [f"data/{dataset_dir}/{f}" for f in self.files]
+        # self.files = ['data/10B/sample_000000.pt', 'data/10B/sample_000001.pt']
         assert len(self.files) > 0, f"did not find any files that match the pattern {dataset_dir}"
 
-        # # load and validate all data shards, count number of tokens in total
-        # print0(f"Dataset: loading {len(self.files)} files")
-        # ntok_total = 0
-        # for fname in self.files:
-        #     shard_ntok = self.load_data_shard(fname).size(0)
-        #     assert shard_ntok > num_processes * batch_size * seq_len
-        #     ntok_total += shard_ntok
-        # self.ntok_total = ntok_total
-        # print0(f"Dataset: total number of tokens: {ntok_total:24,} across {len(self.files)} files")
+        # load and validate all data shards, count number of tokens in total
+        print0(f"Dataset: loading {len(self.files)} files")
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = self.load_data_shard(fname)[0].size(0)
+            assert shard_ntok > num_processes * batch_size * seq_len
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"Dataset: total number of tokens:               {ntok_total:16,}")
+        print0(f"                                        across {len(self.files):16,} files")
 
         # kick things off
-        self.current_shard = None
+        self.current_shard      = None
+        self.global_position    = None
         self.reset()
 
     def reset(self):
         if self.current_shard != 0:
-            self.current_shard = 0
+            self.current_shard   = 0
+            self.global_position = 0
             self.input_ids, self.seq_codes = self.load_data_shard(self.files[self.current_shard])
-        self.current_position = self.process_rank * self.batch_size * self.seq_len
+        self.current_position  = self.process_rank * self.batch_size * self.seq_len
+        self.current_position += self.val_tokens_padding + self.val_tokens
     
     def load_data_shard(self, filename):
         dataset = torch.load(filename)
@@ -77,148 +91,58 @@ class DistributedShardedDataset(IterableDataset):
         return self
     
     def __next__(self):
-        # inputs = torch.empty((self.gradient_accumulation_steps, self.batch_size, self.seq_len), dtype=torch.int64)
-        # seq_codes = torch.empty((self.gradient_accumulation_steps, self.batch_size, self.seq_len), dtype=torch.int64)
-        # targets = torch.empty((self.gradient_accumulation_steps, self.batch_size, self.seq_len), dtype=torch.int64)
-        
-        batches = torch.empty((self.gradient_accumulation_steps, 3, self.batch_size, self.seq_len), dtype=torch.int64)
-        for i in range(self.gradient_accumulation_steps):
-            input_ids = self.input_ids[self.current_position : self.current_position+self.batch_size*self.seq_len+1].long()
-            seq_codes = self.seq_codes[self.current_position : self.current_position+self.batch_size*self.seq_len].long()
-
-            input       = input_ids[:-1].view(self.batch_size, self.seq_len) 
-            targets     = input_ids[1:].view(self.batch_size, self.seq_len)
-            seq_codes   = seq_codes.view(self.batch_size, self.seq_len)
-            
-            batches[i, 0] = input
-            batches[i, 1] = seq_codes
-            batches[i, 2] = targets
-            # batches[i] = torch.stack((input, seq_codes, targets))
-            # batches.append((x, y))
-            # batches.append((input, seq_codes, targets))
-            # batches.append(torch.stack((x, y)))
-            # batches.append({
-            #     'input_ids': input,
-            #     'seq_codes': seq_codes[:-1],
-            #     'labels': targets,
-            # })
-
+        batches = torch.empty((self.grad_accum_steps, 3, self.batch_size, self.seq_len), dtype=torch.int64)
+        for i in range(self.grad_accum_steps):
+            # if loading the next batch would be out of bounds load shards until we have enough data
+            while self.current_position + self.tokens_per_fwd > len(self.input_ids):
+                self.load_next_shard()
+            batches[i] = self.get_batch(self.current_position, self.current_position+self.batch_size*self.seq_len)
             # advance the start pointer in current shard
-            self.current_position += self.batch_size * self.seq_len * self.num_processes
-            # if loading the next batch would be out of bounds advance the shard
-            if self.current_position + (self.batch_size * self.seq_len * self.num_processes + 1) > len(self.input_ids):
-                self.advance_shard()
+            self.current_position += self.tokens_per_batch
         return batches
     
-    def advance_shard(self):
+    def load_next_shard(self):
         self.current_shard = (self.current_shard + 1)
-        if self.current_shard > len(self.files):
+        if self.current_shard >= len(self.files):
             raise StopIteration
-        self.current_position = self.process_rank * self.batch_size * self.seq_len
+        self.current_position = self.process_rank * self.tokens_per_fwd
 
-        self.input_ids = self.input_ids[self.current_position:]
-        self.seq_codes = self.seq_codes[self.current_position:]
+        remainder_pos = round_to_multiple(len(self.input_ids), multiple=self.tokens_per_batch, up=False)
+        self.input_ids = self.input_ids[remainder_pos:]
+        self.seq_codes = self.seq_codes[remainder_pos:]
 
         new_input_ids, new_seq_codes = self.load_data_shard(self.files[self.current_shard])
         self.input_ids = torch.cat([self.input_ids, new_input_ids], dim=0)
         self.seq_codes = torch.cat([self.seq_codes, new_seq_codes], dim=0)
 
+        self.global_position += new_input_ids.size(0)
+        print0(f'Current shard: {self.current_shard}')
+
+    def get_val_dataset(self, device='cpu'):
+        if self.val_tokens == 0:
+            return None
+        else:
+            local_val_batches_count = self.val_tokens // self.tokens_per_batch
+            val_batches = torch.empty((local_val_batches_count, 3, self.batch_size, self.seq_len), dtype=torch.int64)
+            pos = self.process_rank * self.tokens_per_fwd
+            for i in range(local_val_batches_count):
+                val_batches[i] = self.get_batch(pos, pos+self.batch_size*self.seq_len)
+                pos += self.tokens_per_batch
+            return val_batches.to(device)
     
 
-                    
-# -----------------------------------------------------------------------------
-# Python -> C bridge utilities for saving params/grads/activations to .bin files
+    def get_batch(self, start, end):
+        input_ids = self.input_ids[start:end+1].long()
+        seq_codes = self.seq_codes[start:end].long()
 
-def write_fp32(tensor, file):
-    t = tensor.detach().cpu().to(torch.float32)
-    b = t.numpy().tobytes()
-    file.write(b)
+        input       = input_ids[:-1].view(self.batch_size, self.seq_len) 
+        targets     = input_ids[1:].view(self.batch_size, self.seq_len)
+        seq_codes   = seq_codes.view(self.batch_size, self.seq_len)
 
-def write_bf16(tensor, file):
-    t = tensor.detach().cpu().to(torch.bfloat16)
-    # numpy doesn't have bf16 datatype so we have to trick it
-    t = t.view(torch.int16) # trick: reinterpret as int16
-    b = t.numpy().tobytes()
-    file.write(b)
+        # return input, seq_codes, targets
+        return torch.stack([input, seq_codes, targets], dim=0)
+    
 
-def write_tensors(model_tensors, L, file, dtype):
-    # writes LLaMA 3 model's weights to a binary file
-    assert dtype in {"float32", "bfloat16"}
-    write_fun = write_fp32 if dtype == "float32" else write_bf16
-    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
-    for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, 3C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
-    for i in range(L): # (L, C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, 4C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"], file)
-    for i in range(L): # (L, C, 4C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
-    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fun(model_tensors["lm_head.weight"], file) # (V, C)
-
-def write_model(model, filename, dtype):
-    # everything we need to instantiate the model
-    # 1) header is: version int, LLaMAConfig ints, padding to 1024 bytes
-    assert dtype in {"float32", "bfloat16"}
-    version = {
-        "float32": 3, # 3: all tensors are fp32
-        "bfloat16": 5, # 5: all tensors are bf16
-    }[dtype]
-    header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
-    header[1] = version # checkpoint version
-    header[2] = model.config.block_size
-    header[3] = model.config.vocab_size
-    header[4] = model.config.n_layer
-    header[5] = model.config.n_head
-    header[6] = model.config.n_kv_head
-    header[7] = model.config.n_embd
-    header[8] = model.config.ffn_dim_multiplier
-    header[9] = model.config.multiple_of
-    header[10] = model.config.norm_eps
-    header[11] = model.config.rope_theta
-    header[12] = model.config.use_scaled_rope
-    header[13] = model.config.max_gen_batch_size
-    header[14] = int(model.config.version.split('.')[0]) # major version
-    header[15] = int(model.config.version.split('.')[1]) # minor version
-    # 2) the parameters follow the header
-    params = {name: param.cpu() for name, param in model.named_parameters()}
-    # now write to file
-    with open(filename, "wb") as file:
-        file.write(header.numpy().tobytes()) # header
-        write_tensors(params, model.config.n_layer, file, dtype) # params
-    print(f"wrote {filename}")
-
-def write_state(model, x, y, logits, loss, filename):
-    # the state is used for debugging.
-    # it contains information about the input, logits, loss, and the parameter gradients
-    # this can be used for checking the computation correctness in C
-    header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240803 # magic
-    header[1] = x.size(0) # batch size of the batch, B
-    header[2] = x.size(1) # temporal extent of the batch, T
-    grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
-    with open(filename, "wb") as file:
-        # header
-        file.write(header.numpy().tobytes())
-        # input x
-        file.write(x.cpu().numpy().astype("int32").tobytes()) # (B, T)
-        # targets y
-        file.write(y.cpu().numpy().astype("int32").tobytes()) # (B, T)
-        # logits (result of the model forward pass)
-        write_fp32(logits.cpu(), file)
-        # loss (single float, result of the cross entropy loss)
-        write_fp32(loss.cpu(), file)
-        # gradients
-        write_tensors(grads, model.config.n_layer, file, "float32")
-    print(f"wrote {filename}")
 
 # -----------------------------------------------------------------------------
 # int main
@@ -228,6 +152,11 @@ def print0(*args, **kwargs):
     # if this is not a distributed run, it's just a print
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
+
+def round_to_multiple(x, multiple=1, up=False):
+    if x % multiple == 0:
+        return x
+    return x + up*multiple - (x%multiple)
 
 
 def checkpoint(model, model_name='model', rank=None):
@@ -243,24 +172,33 @@ def checkpoint(model, model_name='model', rank=None):
 
 
 class Logger:
-    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, tokens_per_batch=None, model=None):
+    def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, 
+                 tokens_per_batch=None, model=None, val_tokens=0):
         assert model_type is not None
         assert num_iterations is not None
         assert tokens_per_batch is not None
+
+        # create the logging directory if it does not exist
+        os.makedirs(log_dir, exist_ok=True)
+        logfile = os.path.join(log_dir, "main.log")
+        # create the log file "main.log" inside it, and wipe it clean
+        with open(logfile, "w") as f:
+            pass
 
         self.log_dir = log_dir
         self.num_iterations = num_iterations
         self.tokens_per_batch = tokens_per_batch
         self.rank = rank
+        self.val_tokens = val_tokens
         self.model = model
 
         self.train_log_file = f'{self.log_dir}/{model_type}_train.log'
         with open(self.train_log_file, 'w') as f:
-            f.write(f'step,time,loss,norm,lr,tok/sec\n')
+            f.write(f'step,time,loss,norm,lr,exec_time,tok/sec\n')
 
         self.val_log_file = f'{self.log_dir}/{model_type}_val.log'
         with open(self.val_log_file, 'w') as f:
-            f.write(f'step,time,loss,perplexity\n')
+            f.write(f'step,time,loss,exec_time,tok/sec\n')
         
         self.log_init_time = time.time()
         self.last_log_time = self.log_init_time
@@ -274,24 +212,28 @@ class Logger:
     def log(self, step, loss, norm, lr):
         if self.is_main:
             runtime = time.time() - self.log_init_time
-            tokens_per_second = self.tokens_per_batch / (time.time() - self.last_log_time)
+            exec_time = time.time() - self.last_log_time
+            tokens_per_second = self.tokens_per_batch / exec_time
             self.last_log_time = time.time()
-            string = f'{step},{runtime},{loss},{norm},{lr},{tokens_per_second}\n'
+            string = f'{step},{runtime},{loss},{norm},{lr},{exec_time},{tokens_per_second}\n'
             with open(self.train_log_file, 'a') as f:
                 f.write(string)
-            print(f"step {step+1:4d}/{self.num_iterations} | train loss {loss:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(runtime)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+            print(f"step {step+1:4d}/{self.num_iterations} | train loss {loss:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(exec_time):.2f} s | {tokens_per_second:.0f} tok/s)")
         
         # checkpoint(self.model, rank=self.rank)
-        if step % 1000 == 0:
-            checkpoint(self.model, rank=self.rank)
+        # if step % 1000 == 0:
+        #     checkpoint(self.model, rank=self.rank)
         
     
-    def log_val(self, step, loss, perplexity):
+    def log_val(self, step, loss):
         if self.is_main:
             runtime = time.time() - self.log_init_time
-            string = f'{step},{runtime},{loss},{perplexity}\n'
+            exec_time = time.time() - self.last_log_time
+            tokens_per_second = self.val_tokens / exec_time
+            self.last_log_time = time.time()
+            string = f'{step},{runtime},{loss},{exec_time},{tokens_per_second}\n'
             with open(self.val_log_file, 'a') as f:
                 f.write(string)
             # print0(f"val loss {val_loss}")
-            print(f'val loss {loss:.6f} | perplexity {perplexity:.4f}')
-            self.last_log_time = time.time()
+            print(f'val loss {loss:.6f} | ({exec_time:.1f}{(runtime):.1f} s | {tokens_per_second:.0f} tok/s)')
+            checkpoint(self.model, rank=self.rank)

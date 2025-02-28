@@ -40,7 +40,7 @@ import torch.distributed as dist
 ########################################################################################
 ########################################################################################
 from models.model import Transformer, ModelArgs
-from utils import write_model, write_state, print0, DistributedShardedDataset, checkpoint, Logger
+from utils import print0, round_to_multiple, DistributedShardedDataset, checkpoint, Logger
 ########################################################################################
 ########################################################################################
 
@@ -52,16 +52,15 @@ if __name__ == "__main__":
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
     # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
-    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
+    parser.add_argument("--dataset", type=str, default="10B", help="data/ directory containing the training data")
     parser.add_argument("--log_dir", type=str, default="logs", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model", type=str, default="l6", help="l6|l8|l12|l16|l24|l32")
+    parser.add_argument("--model_size", type=str, default="l6", help="l6|l8|l12|l16|l24|l32")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--aprox_tokens_per_step", type=int, default=500_000, help="approximate tokens per step")
+    parser.add_argument("--min_tokens_per_step", type=int, default=500_000, help="minimum number of tokens per step")
     # workload (number of steps)
-    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--num_iterations", type=int, default=float('inf'), help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
@@ -70,8 +69,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
+    parser.add_argument("--min_val_tokens", type=int, default=4_000_000, help="minimum number of tokens for validation")
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
-    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
@@ -81,15 +80,13 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
-    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
-    # python -> C bridge
-    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
+
     args = parser.parse_args()
 
     # args error checking and convenience variables
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model in {"l6", "l8", "l12", "l16", "l24", "l32"}
+    assert args.model_size in {"l6", "l8", "l12", "l16", "l24", "l32"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -104,11 +101,9 @@ if __name__ == "__main__":
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
         seed_offset = 0 # each process gets the exact same seed
-        zero_stage = args.zero_stage
     else:
         ddp_rank = 0
         ddp_local_rank = 0
-        zero_stage = 0
         ddp_world_size = 1
         master_process = True
         seed_offset = 0
@@ -128,10 +123,7 @@ if __name__ == "__main__":
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = int(batch_size * seq_len * ddp_world_size)
-    grad_accum_steps = args.aprox_tokens_per_step / tokens_per_fwdbwd
-    if grad_accum_steps % 1 != 0:
-        grad_accum_steps = grad_accum_steps + 1
-    grad_accum_steps = int(grad_accum_steps)
+    grad_accum_steps = round_to_multiple(args.min_tokens_per_step, multiple=tokens_per_fwdbwd, up=True) // tokens_per_fwdbwd
     tokens_per_batch = tokens_per_fwdbwd * grad_accum_steps
     print0(f"Tokens per Forward Pass:                       {tokens_per_fwdbwd:16,}")
     print0(f"Tokens per Batch:                              {tokens_per_batch:16,}")
@@ -158,7 +150,7 @@ if __name__ == "__main__":
         "l12": ModelArgs(dim=768, n_layers=12, n_heads=16, ffn_dim_multiplier=2),
         "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
         "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
-    }[args.model]
+    }[args.model_size]
     model = Transformer(model_config)
 
     param_count = sum(p.numel() for p in model.parameters())
@@ -179,33 +171,16 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_dataset = DistributedShardedDataset(args.input_bin, batch_size, seq_len, ddp_rank, ddp_world_size, grad_accum_steps)
-    # train_loader = iter(train_dataset)
-    # train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=0, batch_size=None)
-    train_loader = torch.utils.data.DataLoader(train_dataset, num_workers=1, batch_size=None, prefetch_factor=4, pin_memory=True, pin_memory_device=device)
-    val_loader = None
-    if args.input_val_bin:
-        val_loader = DistributedShardedDataset(args.input_val_bin, batch_size, seq_len, ddp_rank, ddp_world_size)
+    dataset = DistributedShardedDataset(args.dataset, batch_size, seq_len, ddp_rank, ddp_world_size, grad_accum_steps, min_val_tokens=args.min_val_tokens)
+    val_dataset = dataset.get_val_dataset(device=device)
+    # train_loader = iter(dataset)
+    # train_loader = torch.utils.data.DataLoader(dataset, num_workers=0, batch_size=None)
+    train_loader = torch.utils.data.DataLoader(dataset, num_workers=1, batch_size=None, prefetch_factor=4, pin_memory=True, pin_memory_device=device)
+    # val_loader = None
+    # if args.input_val_bin:
+    #     val_loader = DistributedShardedDataset(args.input_val_bin, batch_size, seq_len, ddp_rank, ddp_world_size)
+    num_iterations = dataset.ntok_total // tokens_per_batch
 
-    # -------------------------------------------------------------------------
-    # PyTorch -> C bridge: save some weights and state for C to load later as reference
-
-    # # do one forward pass to generate ground truth for our C tests
-    # if master_process and args.write_tensors and (not args.inference_only):
-    #     x, y = train_loader.next_batch()
-    #     x, y = x.to(device), y.to(device)
-    #     logits, loss = model(x, y)
-    #     loss.backward()
-    #     # save model params, in bfloat16
-    #     model_to_size = {f"l{l}": f"l{l}" for l in [12, 24, 36, 48]}
-
-    #     model_size_str = model_to_size[args.model]
-    #     write_model(model, os.path.join(args.output_dir, f"{args.model}.bin"), dtype=args.dtype)
-    #     # save x, y, logits, loss, and parameter gradients, for debugging C
-    #     # always store these in fp32 to have an accurate reference (?)
-    #     write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"{args.model}_debug_state.bin"))
-    #     # reset the train_loader for the optimization below
-    #     train_loader.reset()
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -234,28 +209,20 @@ if __name__ == "__main__":
         if it < args.warmup_iters:
             return args.learning_rate * (it+1) / args.warmup_iters
         # 2) if it > lr_decay_iters, return min learning rate
-        if it > args.num_iterations:
+        if it > num_iterations:
             return min_lr
         # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+        decay_ratio = (it - args.warmup_iters) / (num_iterations - args.warmup_iters)
         assert 0 <= decay_ratio <= 1
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
         return min_lr + coeff * (args.learning_rate - min_lr)
-
-    # create the logging directory if it does not exist
-    logfile = None
-    if args.log_dir:
-        os.makedirs(args.log_dir, exist_ok=True)
-        logfile = os.path.join(args.log_dir, "main.log")
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    logger0 = Logger(model_type=args.model, rank=ddp_rank, num_iterations=args.num_iterations, 
+    logger0 = Logger(log_dir=args.log_dir, model_type=args.model_size, rank=ddp_rank, 
+                     num_iterations=num_iterations, val_tokens=dataset.val_tokens,
                      tokens_per_batch=tokens_per_batch, model=model.module if ddp else model)
     # for step in range(args.num_iterations + 1):
     for step, batches in enumerate(train_loader):
@@ -265,21 +232,19 @@ if __name__ == "__main__":
         # once in a while evaluate the validation dataset
         if (args.val_loss_every > 0 \
             and (step % args.val_loss_every == 0 or last_step)) \
-            and (val_loader is not None):
+            and (val_dataset is not None):
             model.eval()
-            checkpoint(model, rank=ddp_rank)
-            val_loader.reset()
+            # checkpoint(model, rank=ddp_rank)
+            # val_dataset.reset()
             with torch.no_grad():
                 val_loss = 0.0
-                for _ in range(args.val_max_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=-1)
+                for input_ids, seq_codes, targets in val_dataset:
+                    logits = model(input_ids, seq_codes=seq_codes)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
                     val_loss += loss.item()
-                val_loss /= args.val_max_steps
+                val_loss /= len(val_dataset)
             # log to console and to file
-            logger0.log_val(step, val_loss, 0)
+            logger0.log_val(step, val_loss)
 
         # once in a while perform model inference on the master process
         if (args.sample_every > 0 \

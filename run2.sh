@@ -10,13 +10,13 @@
 
 # python \
 export NCCL_P2P_DISABLE=1
-# export CUDA_VISIBLE_DEVICES=0,1,2
 # export CUDA_VISIBLE_DEVICES=1,2,3,4,5
-export CUDA_VISIBLE_DEVICES=3,4,5
+export CUDA_VISIBLE_DEVICES=0,1,2
+# export CUDA_VISIBLE_DEVICES=3,4,5
 time torchrun --standalone --nproc_per_node 3 \
     train.py \
         --dataset="10B" \
-        --log_dir="logs/tests/s1" \
+        --log_dir="logs/tests/s2" \
         --sequence_length=1024 \
         --batch_size=24 \
         --weight_decay=0.1  \
