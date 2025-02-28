@@ -151,6 +151,8 @@ if __name__ == "__main__":
         "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
         "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
     }[args.model_size]
+    model_config.max_seq_len = seq_len
+    model_config.max_batch_size = batch_size
     model = Transformer(model_config)
 
     param_count = sum(p.numel() for p in model.parameters())
