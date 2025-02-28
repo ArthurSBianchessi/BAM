@@ -16,7 +16,8 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
-    vocab_size: int = -1
+    vocab_size: int = 50257
+    # vocab_size: int = 32768 
     multiple_of: int = 1  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
@@ -95,34 +96,18 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        # self.cache_k = torch.zeros(
-        #     (
+        # self.register_buffer('cache_k', torch.zeros((
         #         args.max_batch_size,
         #         args.max_seq_len,
         #         self.n_local_kv_heads,
         #         self.head_dim,
-        #     )
-        # ).cuda()
-        # self.cache_v = torch.zeros(
-        #     (
+        # )), persistent=False)
+        # self.register_buffer('cache_v', torch.zeros((
         #         args.max_batch_size,
         #         args.max_seq_len,
         #         self.n_local_kv_heads,
         #         self.head_dim,
-        #     )
-        # ).cuda()
-        self.register_buffer('cache_k', torch.zeros((
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-        )), persistent=False)
-        self.register_buffer('cache_v', torch.zeros((
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-        )), persistent=False)
+        # )), persistent=False)
 
 
     def forward(
@@ -141,22 +126,24 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        # self.cache_k = self.cache_k.to(xq)
+        # self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        # keys = self.cache_k[:bsz, : start_pos + seqlen]
+        # values = self.cache_v[:bsz, : start_pos + seqlen]
+        keys = xk
+        values = xv
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(
-            values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        # # repeat k/v heads if n_kv_heads < n_heads
+        # keys = repeat_kv(
+        #     keys, self.n_rep
+        # )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        # values = repeat_kv(
+        #     values, self.n_rep
+        # )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -218,11 +205,8 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        print(x.shape, x.isnan().sum())
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-        print(h.shape, h.isnan().sum())
         out = h + self.feed_forward(self.ffn_norm(h))
-        print(out.shape, out.isnan().sum())
         return out
 
 
@@ -248,7 +232,7 @@ class Transformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -260,16 +244,23 @@ class Transformer(nn.Module):
 
             mask = torch.triu(mask, diagonal=1)
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
+            if seq_codes is not None:
+                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
+                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
+                mask[section_mask] = float("-inf")
+                mask = mask.unsqueeze(-3)
+                
+
+            # # When performing key-value caching, we compute the attention scores
+            # # only for the new sequence. Thus, the matrix of scores is of size
+            # # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # # j > cache_len + i, since row i corresponds to token cache_len + i.
+            # mask = torch.hstack(
+            #     [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            # ).type_as(h)
+            mask = mask.type_as(h)
 
         for layer in self.layers:
-            # print(h.shape, h.isnan().sum())
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
