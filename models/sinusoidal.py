@@ -11,7 +11,7 @@ from torch import nn
 
 
 @dataclass
-class RotaryModelArgs:
+class SinusoidalModelArgs:
     dim: int = 1024
     n_layers: int = 32
     n_heads: int = 32
@@ -20,7 +20,7 @@ class RotaryModelArgs:
     multiple_of: int = 1  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-    rope_theta: float = 500000
+    sinusoidal_theta: float = 10_000
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
@@ -39,35 +39,6 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -81,7 +52,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: RotaryModelArgs):
+    def __init__(self, args: SinusoidalModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
@@ -97,7 +68,6 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
@@ -107,13 +77,9 @@ class Attention(nn.Module):
         keys = keys.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         values = values.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        queries, keys = apply_rotary_emb(queries, keys, freqs_cis=freqs_cis)
-
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
@@ -146,7 +112,7 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: RotaryModelArgs):
+    def __init__(self, layer_id: int, args: SinusoidalModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -165,16 +131,15 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
+        h = x + self.attention(self.attention_norm(x), mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
-class RotaryTransformer(nn.Module):
-    def __init__(self, params: RotaryModelArgs):
+class SinusoidalTransformer(nn.Module):
+    def __init__(self, params: SinusoidalModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -189,17 +154,12 @@ class RotaryTransformer(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        self.freqs_cis = precompute_freqs_cis(
-            params.dim // params.n_heads,
-            params.max_seq_len * 2,
-            params.rope_theta,
-        )
+        self.position_embeddings = self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta)
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[:seqlen]
+        h = h + self.position_embeddings[:seqlen]
 
         mask = None
         if seqlen > 1:
@@ -216,7 +176,16 @@ class RotaryTransformer(nn.Module):
             mask = mask.type_as(h)
 
         for layer in self.layers:
-            h = layer(h, freqs_cis, mask)
+            h = layer(h, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
+    
+    def sinusoidal_position_embeddings(self, num_embeddings, embedding_dim, theta=10_000):
+        embedding = torch.zeros(num_embeddings, embedding_dim)
+        embedding_positions = torch.arange(0, num_embeddings).float()
+        sin_div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * -(math.log(theta) / embedding_dim))
+        cos_div_term = torch.exp(torch.arange(1, embedding_dim, 2).float() * -(math.log(theta) / embedding_dim))
+        embedding[:, 0::2] = torch.sin(embedding_positions.unsqueeze(1) * sin_div_term)
+        embedding[:, 1::2] = torch.cos(embedding_positions.unsqueeze(1) * cos_div_term)
+        return embedding
