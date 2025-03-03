@@ -72,6 +72,7 @@ class DistributedShardedDataset(IterableDataset):
         # kick things off
         self.current_shard      = None
         self.global_position    = None
+        self.world_position     = None
         self.reset()
 
     def reset(self):
@@ -79,6 +80,7 @@ class DistributedShardedDataset(IterableDataset):
             self.current_shard   = 0
             self.global_position = 0
             self.input_ids, self.seq_codes = self.load_data_shard(self.files[self.current_shard])
+        self.world_position    = self.val_tokens_padding + self.val_tokens
         self.current_position  = self.process_rank * self.batch_size * self.seq_len
         self.current_position += self.val_tokens_padding + self.val_tokens
     
@@ -91,12 +93,17 @@ class DistributedShardedDataset(IterableDataset):
         return self
     
     def __next__(self):
+        # if loading the next batch would be out of bounds load shards until we have enough data
+        self.world_position += self.tokens_per_batch*self.grad_accum_steps
+        while self.world_position + 1 > len(self.input_ids):
+            self.load_next_shard()
+
         batches = torch.empty((self.grad_accum_steps, 3, self.batch_size, self.seq_len), dtype=torch.int64)
         for i in range(self.grad_accum_steps):
-            # if loading the next batch would be out of bounds load shards until we have enough data
-            while self.current_position + self.tokens_per_fwd > len(self.input_ids):
-                self.load_next_shard()
-            batches[i] = self.get_batch(self.current_position, self.current_position+self.batch_size*self.seq_len)
+            # # if loading the next batch would be out of bounds load shards until we have enough data
+            # while self.current_position + self.tokens_per_fwd + 1 > len(self.input_ids):
+            #     self.load_next_shard()
+            batches[i] = self.get_batch(self.current_position, self.current_position+self.tokens_per_fwd)
             # advance the start pointer in current shard
             self.current_position += self.tokens_per_batch
         return batches
@@ -106,8 +113,9 @@ class DistributedShardedDataset(IterableDataset):
         if self.current_shard >= len(self.files):
             raise StopIteration
         self.current_position = self.process_rank * self.tokens_per_fwd
+        self.world_position   = self.tokens_per_batch*self.grad_accum_steps
 
-        remainder_pos = round_to_multiple(len(self.input_ids), multiple=self.tokens_per_batch, up=False)
+        remainder_pos = round_to_multiple(len(self.input_ids), multiple=self.tokens_per_batch*self.grad_accum_steps, up=False)
         self.input_ids = self.input_ids[remainder_pos:]
         self.seq_codes = self.seq_codes[remainder_pos:]
 
@@ -116,7 +124,6 @@ class DistributedShardedDataset(IterableDataset):
         self.seq_codes = torch.cat([self.seq_codes, new_seq_codes], dim=0)
 
         self.global_position += new_input_ids.size(0)
-        print0(f'Current shard: {self.current_shard}')
 
     def get_val_dataset(self, device='cpu'):
         if self.val_tokens == 0:

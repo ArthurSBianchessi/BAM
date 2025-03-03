@@ -39,7 +39,12 @@ import torch.distributed as dist
 
 ########################################################################################
 ########################################################################################
-from models.model import Transformer, ModelArgs
+# from models.model import Transformer, ModelArgs
+from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
+from models.rotary import RotaryModelArgs, RotaryTransformer
+from models.alibi import ALiBiModelArgs, ALiBiTransformer
+from models.bam import BATransformer, BATModelArgs
+
 from utils import print0, round_to_multiple, DistributedShardedDataset, checkpoint, Logger
 ########################################################################################
 ########################################################################################
@@ -55,6 +60,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="10B", help="data/ directory containing the training data")
     parser.add_argument("--log_dir", type=str, default="logs", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model_size", type=str, default="l6", help="l6|l8|l12|l16|l24|l32")
+    parser.add_argument("--position_encoding", type=str, default="rotary", help="rotary|sinusoidal|alibi")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -143,11 +149,19 @@ if __name__ == "__main__":
     if args.tensorcores:
         torch.set_float32_matmul_precision('high')
 
+    # -------------------------------------------------------------------------
+    ModelArgs, Transformer = {
+        "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
+        "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
+        "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
+        "bam":          (BATModelArgs,          BATransformer           ),
+    }[args.position_encoding]
+
     # init the model
     model_config = {
-        "l6": ModelArgs(dim=512, n_layers=6, n_heads=16, ffn_dim_multiplier=2),
-        "l8": ModelArgs(dim=768, n_layers=8, n_heads=16, ffn_dim_multiplier=2),
-        "l12": ModelArgs(dim=768, n_layers=12, n_heads=16, ffn_dim_multiplier=2),
+        "l6":  ModelArgs(dim=512,  n_layers=6,  n_heads=16, ffn_dim_multiplier=2),
+        "l8":  ModelArgs(dim=768,  n_layers=8,  n_heads=16, ffn_dim_multiplier=2),
+        "l12": ModelArgs(dim=768,  n_layers=12, n_heads=16, ffn_dim_multiplier=2),
         "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
         "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
     }[args.model_size]
@@ -327,6 +341,7 @@ if __name__ == "__main__":
             param_group['lr'] = lr
         # step the optimizer
         optimizer.step()
+
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -339,7 +354,7 @@ if __name__ == "__main__":
         # log
         logger0.log(step, lossf, norm, lr)
         
-    print0(f"peak memory consumption:                       {torch.cuda.max_memory_allocated() // 1024 / 1024:16,.2} MiB")
+    print0(f"peak memory consumption:                       {torch.cuda.max_memory_allocated() // 1024 / 1024:16,.2f} MiB")
 
     # -------------------------------------------------------------------------
     # clean up nice
