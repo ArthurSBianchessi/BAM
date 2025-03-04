@@ -172,13 +172,38 @@ def checkpoint(model, model_name='model', rank=None):
     for k, v in state_dict.items():
         state_dict[k] = v.cpu()
     if rank is not None:
-        filename = f'checkpoints/{model_name}_{rank}.pt'
+        filename = f'checkpoints/{model_name}_{rank}_6.pt'
     else:
-        filename=f'checkpoints/{model_name}.pt'
+        filename=f'checkpoints/{model_name}_6.pt'
     torch.save(state_dict, filename)
 
+def get_execution_vars(device=None):
+    is_ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    if is_ddp:
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        # select the device
+        if device is None:
+            # attempt to autodetect the device
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+    return is_ddp, ddp_rank, ddp_local_rank, ddp_world_size, device
 
-class Logger:
+
+class StateMonitor:
     def __init__(self, log_dir='logs', rank=0, model_type=None, num_iterations=None, 
                  tokens_per_batch=None, model=None, val_tokens=0):
         assert model_type is not None
@@ -195,6 +220,7 @@ class Logger:
         self.log_dir = log_dir
         self.num_iterations = num_iterations
         self.tokens_per_batch = tokens_per_batch
+        
         self.rank = rank
         self.val_tokens = val_tokens
         self.model = model

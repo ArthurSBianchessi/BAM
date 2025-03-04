@@ -155,7 +155,8 @@ class ALiBiTransformer(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        self.slopes = torch.tensor(self.get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1)
+        # self.slopes = torch.tensor(self.get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1)
+        self.register_buffer("slopes", torch.tensor(self.get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1), persistent=False)
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
@@ -177,7 +178,7 @@ class ALiBiTransformer(nn.Module):
 
             positions = torch.arange(seqlen, device=tokens.device).float()
             position_encodings = -(positions[None, :] - positions[:, None]).abs() * self.slopes
-            mask = mask + position_encodings
+            mask = mask + position_encodings.to(mask.device)
 
             mask = mask.type_as(h)
 

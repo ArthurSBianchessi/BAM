@@ -154,12 +154,14 @@ class SinusoidalTransformer(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        self.position_embeddings = self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta)
+        self.position_embeddings = self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta).unsqueeze(0)
+        # self.register_buffer("position_embeddings", 
+        #     self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta))
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        h = h + self.position_embeddings[:seqlen]
+        h = h + self.position_embeddings[:seqlen].to(h.device)
 
         mask = None
         if seqlen > 1:

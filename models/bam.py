@@ -23,15 +23,17 @@ class BATModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
-    shape_init: float = 0
+    # shape_init: float | str = 'linear'
+    # scale_init: float | str = 1/16
+    shape_init: float | str = 1
     scale_init: float | str = 'slope'
     loc_init:   float = 0
 
     train_shape: bool = True
-    train_scale: bool = True
-    train_loc:   bool = True
+    train_scale: bool = False
+    train_loc:   bool = False
 
-    global_positional_encoding: bool = True
+    global_positional_encoding: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -61,7 +63,9 @@ class AttentionPrior(nn.Module):
             scale = torch.full((1, args.n_heads, 1, 1), args.scale_init, dtype=torch.float)
         # self.register_buffer("scale", torch.tensor(get_slopes(args.n_heads)).reshape(1, args.n_heads, 1, 1))
         
-        if args.train_shape:
+        if args.train_shape and args.shape_init == 'linear':
+            shape  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
+        elif args.train_shape:
             shape   = torch.full((1, args.n_heads, 1, 1), args.shape_init, dtype=torch.float)
         else:
             shape   = torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
@@ -93,10 +97,11 @@ class AttentionPrior(nn.Module):
         # positions = torch.arange(seq_len).float().to(self.scale.device)
 
         positions = torch.arange(self.seq_len, device=self.scale.device).float()
-        dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len) + self.eps
+        dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
         # return -(dist_matrix.abs() * self.scale).abs()
         # return -(dist_matrix * self.scale + self.loc).abs()
-        return -(dist_matrix * self.scale + self.loc).abs()**self.shape
+        z = dist_matrix * self.scale + self.loc
+        return -( (z.abs()+self.eps)**self.shape )
     
 
 def get_slopes(n):

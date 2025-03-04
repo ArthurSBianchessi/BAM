@@ -45,7 +45,7 @@ from models.rotary import RotaryModelArgs, RotaryTransformer
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam import BATransformer, BATModelArgs
 
-from utils import print0, round_to_multiple, DistributedShardedDataset, checkpoint, Logger
+from utils import print0, round_to_multiple, get_execution_vars, DistributedShardedDataset, StateMonitor
 ########################################################################################
 ########################################################################################
 
@@ -95,35 +95,25 @@ if __name__ == "__main__":
     assert args.model_size in {"l6", "l8", "l12", "l16", "l24", "l32"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
-    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-    if ddp:
-        # use of DDP atm demands CUDA, we set the device appropriately according to rank
-        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-        init_process_group(backend='nccl')
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = f'cuda:{ddp_local_rank}'
-        torch.cuda.set_device(device)
-        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-        seed_offset = 0 # each process gets the exact same seed
-    else:
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        master_process = True
-        seed_offset = 0
-        # select the device
-        if args.device:
-            # provided explicitly by the user
-            device = args.device
-        else:
-            # attempt to autodetect the device
-            device = "cpu"
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
+    # ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    # if ddp:
+    #     ddp_rank, ddp_local_rank, ddp_world_size, device = get_ddp_vars()
+    # else:
+    #     ddp_rank = 0
+    #     ddp_local_rank = 0
+    #     ddp_world_size = 1
+    #     # select the device
+    #     if args.device:
+    #         # provided explicitly by the user
+    #         device = args.device
+    #     else:
+    #         # attempt to autodetect the device
+    #         device = "cpu"
+    #         if torch.cuda.is_available():
+    #             device = "cuda"
+    #         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    #             device = "mps"
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = get_execution_vars(device=args.device)
     print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
 
@@ -237,9 +227,9 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    logger0 = Logger(log_dir=args.log_dir, model_type=args.model_size, rank=ddp_rank, 
-                     num_iterations=num_iterations, val_tokens=dataset.val_tokens,
-                     tokens_per_batch=tokens_per_batch, model=model.module if ddp else model)
+    logger0 = StateMonitor( log_dir=args.log_dir, model_type=args.model_size, rank=ddp_rank, 
+                            num_iterations=num_iterations, val_tokens=dataset.val_tokens,
+                            tokens_per_batch=tokens_per_batch, model=model.module if ddp else model)
     # for step in range(args.num_iterations + 1):
     for step, batches in enumerate(train_loader):
         t0 = time.time()
@@ -265,7 +255,7 @@ if __name__ == "__main__":
         # once in a while perform model inference on the master process
         if (args.sample_every > 0 \
             and (step % args.sample_every == 0 or last_step)) \
-            and master_process:
+            and ddp_local_rank == 0:
             model.eval()
             prompts: List[str] = [
         "Clearly, the meaning of life is",
