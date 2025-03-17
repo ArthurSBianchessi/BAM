@@ -28,6 +28,7 @@ import time
 from typing import (
     List
 )
+import json
 
 import numpy as np
 import torch
@@ -45,7 +46,7 @@ from models.rotary import RotaryModelArgs, RotaryTransformer
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam import BATransformer, BATModelArgs
 
-from utils import print0, round_to_multiple, get_execution_vars, DistributedShardedDataset, StateMonitor
+from utils import print0, round_to_multiple, set_lr, DistributedShardedDataset, StateMonitor
 ########################################################################################
 ########################################################################################
 
@@ -59,15 +60,28 @@ if __name__ == "__main__":
     # file system input / output
     parser.add_argument("--dataset", type=str, default="10B", help="data/ directory containing the training data")
     parser.add_argument("--log_dir", type=str, default="logs", help="output directory to which to write logs and checkpoints")
-    parser.add_argument("--model_size", type=str, default="l6", help="l6|l8|l12|l16|l24|l32")
-    parser.add_argument("--position_encoding", type=str, default="rotary", help="rotary|sinusoidal|alibi")
+    parser.add_argument("--position_encoding", type=str, default="rotary", help="rotary|sinusoidal|alibi|bam")
+    parser.add_argument("--model_size", type=str, default="l12", help="l6|l8|l12|l16|l24|l32")
+    # Bayesian Attention Mechanism specific arguments
+    parser.add_argument("--global_prior", type=bool, default=True, help="whether to use a global prior for BAM (True|False)")
+    parser.add_argument("--shape_init", type=str, default=1, help="initial shape exponent for BAM, either a string, float or a list of floats")
+    parser.add_argument("--scale_init", type=str, default='slope', help="initial scale multiplier for BAM, either a string, float or a list of floats")
+    parser.add_argument("--loc_init", type=str, default=0, help="initial location sum for BAM, either a string, float or a list of floats")
+    parser.add_argument("--shape_trainable", type=bool, default=True, help="trainable shape exponent for BAM")
+    parser.add_argument("--scale_trainable", type=bool, default=True, help="trainable scale multiplier for BAM")
+    parser.add_argument("--loc_trainable", type=bool, default=True, help="trainable location sum for BAM")
+    parser.add_argument("--shape_lr", type=float, default=1e-4, help="learning rate for shape exponent")
+    parser.add_argument("--scale_lr", type=float, default=1e-4, help="learning rate for scale multiplier")
+    parser.add_argument("--loc_lr", type=float, default=1e-4, help="learning rate for location sum")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--min_tokens_per_step", type=int, default=500_000, help="minimum number of tokens per step")
+    parser.add_argument("--min_tokens_per_step", type=int, default=None, help="minimum number of tokens per step")
+    parser.add_argument("--tokens_per_step", type=int, default=None, help="exact number of tokens per step")
+    parser.add_argument("--max_tokens_per_step", type=int, default=None, help="maximum number of tokens per step")
     # workload (number of steps)
     parser.add_argument("--num_iterations", type=int, default=float('inf'), help="number of iterations to run")
-    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    parser.add_argument("--inference_only", type=bool, default=0, help="only run inference")
     # optimization
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
     parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
@@ -75,16 +89,19 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
-    parser.add_argument("--min_val_tokens", type=int, default=4_000_000, help="minimum number of tokens for validation")
+    parser.add_argument("--min_val_tokens", type=int, default=None, help="minimum number of tokens for validation")
+    parser.add_argument("--val_tokens", type=int, default=None, help="number of tokens for validation")
+    parser.add_argument("--max_val_tokens", type=int, default=None, help="maximum number of tokens for validation")
+    parser.add_argument("--val_tokens_padding", type=int, default=1_000_000, help="Number of tokens between validation and training data")
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
-    parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
+    parser.add_argument("--overfit_single_batch", type=bool, default=0, help="overfit just one batch of data")
     # numerics
-    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    parser.add_argument("--tensorcores", type=bool, default=0, help="use tensorcores")
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
-    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--compile", type=bool, default=0, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
 
     args = parser.parse_args()
@@ -92,38 +109,74 @@ if __name__ == "__main__":
     # args error checking and convenience variables
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model_size in {"l6", "l8", "l12", "l16", "l24", "l32"}
+    assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
+    assert args.position_encoding in {"rotary", "sinusoidal", "alibi", "bam"}
+    # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
+    assert sum([args.min_tokens_per_step is not None, 
+                args.tokens_per_step is not None, 
+                args.max_tokens_per_step is not None]) == 1, "only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step can be set"
+    assert sum([args.max_val_tokens is not None, 
+                args.val_tokens is not None, 
+                args.min_val_tokens is not None]) <= 1, "only one of max_val_tokens, val_tokens, min_val_tokens can be set"
+
+    if args.tokens_per_step is not None:
+        assert args.tokens_per_step % (batch_size * seq_len) == 0
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
-    # ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-    # if ddp:
-    #     ddp_rank, ddp_local_rank, ddp_world_size, device = get_ddp_vars()
-    # else:
-    #     ddp_rank = 0
-    #     ddp_local_rank = 0
-    #     ddp_world_size = 1
-    #     # select the device
-    #     if args.device:
-    #         # provided explicitly by the user
-    #         device = args.device
-    #     else:
-    #         # attempt to autodetect the device
-    #         device = "cpu"
-    #         if torch.cuda.is_available():
-    #             device = "cuda"
-    #         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #             device = "mps"
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = get_execution_vars(device=args.device)
+    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    if ddp:
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        # select the device
+        if args.device:
+            # provided explicitly by the user
+            device = args.device
+        else:
+            # attempt to autodetect the device
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+    # ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = get_execution_vars(device=args.device)
     print(f"using device: {device}")
     device_type = 'cuda' if 'cuda' in device else 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
+    
     tokens_per_fwdbwd = int(batch_size * seq_len * ddp_world_size)
-    grad_accum_steps = round_to_multiple(args.min_tokens_per_step, multiple=tokens_per_fwdbwd, up=True) // tokens_per_fwdbwd
+    if args.min_tokens_per_step is not None:
+        grad_accum_steps = round_to_multiple(args.min_tokens_per_step, multiple=tokens_per_fwdbwd, up=True) // tokens_per_fwdbwd
+    elif args.tokens_per_step is not None:
+        grad_accum_steps = args.tokens_per_step // tokens_per_fwdbwd
+    elif args.max_tokens_per_step is not None:
+        grad_accum_steps = round_to_multiple(args.max_tokens_per_step, multiple=tokens_per_fwdbwd, down=True) // tokens_per_fwdbwd
     tokens_per_batch = tokens_per_fwdbwd * grad_accum_steps
     print0(f"Tokens per Forward Pass:                       {tokens_per_fwdbwd:16,}")
     print0(f"Tokens per Batch:                              {tokens_per_batch:16,}")
     print0(f"=> calculated gradient accumulation steps:     {grad_accum_steps:16,}")
+
+    if args.val_tokens is not None:
+        val_tokens = args.val_tokens
+    elif args.max_val_tokens is not None:
+        val_tokens = round_to_multiple(args.max_val_tokens, multiple=tokens_per_fwdbwd, up=False)
+    elif args.min_val_tokens is not None:
+        val_tokens = round_to_multiple(args.min_val_tokens, multiple=tokens_per_fwdbwd, up=True)
+    else:
+        val_tokens = 3_932_160
+    args.val_tokens = val_tokens
+    print0(f"Validation Tokens:                             {val_tokens:16,}")
+
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
@@ -153,10 +206,23 @@ if __name__ == "__main__":
         "l8":  ModelArgs(dim=768,  n_layers=8,  n_heads=16, ffn_dim_multiplier=2),
         "l12": ModelArgs(dim=768,  n_layers=12, n_heads=16, ffn_dim_multiplier=2),
         "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
+        "l18": ModelArgs(dim=1536, n_layers=18, n_heads=16, ffn_dim_multiplier=2),
         "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
     }[args.model_size]
     model_config.max_seq_len = seq_len
     model_config.max_batch_size = batch_size
+    if args.position_encoding == "bam":
+        model_config.shape_init = args.shape_init
+        model_config.scale_init = args.scale_init
+        model_config.loc_init = args.loc_init
+        model_config.train_shape = args.shape_trainable
+        model_config.train_scale = args.scale_trainable
+        model_config.train_loc = args.loc_trainable
+        model_config.global_positional_encoding = args.global_prior
+    # if args.position_encoding == "alibi":
+    #     model_config.scale_init = args.scale_init
+    #     model_config.train_scale = args.scale_trainable
+
     model = Transformer(model_config)
 
     param_count = sum(p.numel() for p in model.parameters())
@@ -177,15 +243,12 @@ if __name__ == "__main__":
     # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    dataset = DistributedShardedDataset(args.dataset, batch_size, seq_len, ddp_rank, ddp_world_size, grad_accum_steps, min_val_tokens=args.min_val_tokens)
+    dataset = DistributedShardedDataset(args.dataset, batch_size, seq_len, ddp_rank, ddp_world_size, grad_accum_steps, 
+                                        val_tokens=val_tokens, val_tokens_padding=args.val_tokens_padding)
+    dataset_args = dataset.get_args()
     val_dataset = dataset.get_val_dataset(device=device)
-    # train_loader = iter(dataset)
-    # train_loader = torch.utils.data.DataLoader(dataset, num_workers=0, batch_size=None)
     train_loader = torch.utils.data.DataLoader(dataset, num_workers=1, batch_size=None, prefetch_factor=4, pin_memory=True, pin_memory_device=device)
-    # val_loader = None
-    # if args.input_val_bin:
-    #     val_loader = DistributedShardedDataset(args.input_val_bin, batch_size, seq_len, ddp_rank, ddp_world_size)
-    num_iterations = dataset.ntok_total // tokens_per_batch
+    num_iterations = min(dataset_args.iterations, args.num_iterations)
 
 
     # -------------------------------------------------------------------------
@@ -201,12 +264,22 @@ if __name__ == "__main__":
     #                               betas=(0.9, 0.95), weight_decay=args.weight_decay,
     #                               fused=('fused' in inspect.signature(torch.optim.AdamW).parameters and device_type == 'cuda')
     # )
-    param_dict = {pn: p for pn, p in model.module.named_parameters() if p.requires_grad}
+    # param_dict = {pn: p for pn, p in model.module.named_parameters() if p.requires_grad}
+    # optim_groups = [
+    #     {'params': [p for n, p in param_dict.items() if p.dim() >= 2], 'weight_decay': args.weight_decay},
+    #     {'params': [p for n, p in param_dict.items() if p.dim() < 2], 'weight_decay': 0.0}
+    # ]
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
-        {'params': [p for n, p in param_dict.items() if p.dim() >= 2], 'weight_decay': args.weight_decay},
-        {'params': [p for n, p in param_dict.items() if p.dim() < 2], 'weight_decay': 0.0}
+        {'params': [p for n, p in param_dict.items() if p.dim() >= 2 and 'prior' not in n], 'weight_decay': args.weight_decay, 'init_lr': args.learning_rate},
+        {'params': [p for n, p in param_dict.items() if p.dim() < 2  and 'prior' not in n], 'weight_decay': 0.0, 'init_lr': args.learning_rate},
+        {'params': [p for n, p in param_dict.items() if 'shape' in n], 'weight_decay': 0.0, 'lr': args.shape_lr, 'init_lr': args.shape_lr},
+        {'params': [p for n, p in param_dict.items() if 'scale' in n], 'weight_decay': 0.0, 'lr': args.scale_lr, 'init_lr': args.scale_lr},
+        {'params': [p for n, p in param_dict.items() if 'loc'   in n], 'weight_decay': 0.0, 'lr': args.loc_lr,   'init_lr': args.loc_lr},
     ]
     optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+
+
 
     # learning rate decay scheduler (cosine with warmup)
     def get_lr(it):
@@ -227,9 +300,13 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
-    logger0 = StateMonitor( log_dir=args.log_dir, model_type=args.model_size, rank=ddp_rank, 
-                            num_iterations=num_iterations, val_tokens=dataset.val_tokens,
-                            tokens_per_batch=tokens_per_batch, model=model.module if ddp else model)
+    # monitor0 = StateMonitor(log_dir=args.log_dir, model_type=args.model_size, rank=ddp_rank, 
+    #                         num_iterations=num_iterations, val_tokens=dataset.val_tokens,
+    #                         tokens_per_batch=tokens_per_batch, model=raw_model)
+    
+    # def __init__(self, args, dataset_args, model_args, model, rank=0):
+    monitor0 = StateMonitor(args, dataset_args, model_config, raw_model, optimizer, rank=ddp_rank)
+                            
     # for step in range(args.num_iterations + 1):
     for step, batches in enumerate(train_loader):
         t0 = time.time()
@@ -249,8 +326,13 @@ if __name__ == "__main__":
                     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
                     val_loss += loss.item()
                 val_loss /= len(val_dataset)
+            if ddp:
+                val_loss = torch.tensor(val_loss).to(device)
+                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                val_loss /= ddp_world_size
+                val_loss = val_loss.item()
             # log to console and to file
-            logger0.log_val(step, val_loss)
+            monitor0.log_val(step, val_loss)
 
         # once in a while perform model inference on the master process
         if (args.sample_every > 0 \
@@ -296,9 +378,6 @@ if __name__ == "__main__":
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
         lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
         for micro_step, (input_ids, seq_codes, targets) in enumerate(batches):
-        # for micro_step in range(grad_accum_steps):
-            # fetch a batch
-            # x, y = train_loader.next_batch()
             input_ids, seq_codes, targets = input_ids.to(device), seq_codes.to(device), targets.to(device)
             # input_ids, targets = input_ids.to(device), targets.to(device)
             if ddp:
@@ -308,8 +387,6 @@ if __name__ == "__main__":
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             # forward pass
             with ctx:
-                # _, loss = model(x)
-                # logits = model(input_ids)
                 logits = model(input_ids, seq_codes=seq_codes)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
                 # we have to scale the loss to account for gradient accumulation,
@@ -325,12 +402,18 @@ if __name__ == "__main__":
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
         lossf = lossf.item()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        # # determine and set the learning rate for this iteration
+        optimizer = set_lr(optimizer, step, num_iterations, args)
+        # lr = get_lr(step)
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr
+        
         # step the optimizer
-        optimizer.step()
+        if lossf == lossf: # check for NaN
+            optimizer.step()
+        else:
+            print0("NaN Loss, Stop Training")
+            break
 
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
@@ -342,9 +425,26 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         
         # log
-        logger0.log(step, lossf, norm, lr)
+        monitor0.log(step, lossf, norm, optimizer.param_groups[0]['lr'])
         
-    print0(f"peak memory consumption:                       {torch.cuda.max_memory_allocated() // 1024 / 1024:16,.2f} MiB")
+    monitor0.save_model()
+    monitor0.max_memory()
+
+    # once in a while evaluate the validation dataset
+    if (args.val_loss_every > 0) and (val_dataset is not None):
+        model.eval()
+        # checkpoint(model, rank=ddp_rank)
+        # val_dataset.reset()
+        with torch.no_grad():
+            val_loss = 0.0
+            for input_ids, seq_codes, targets in val_dataset:
+                logits = model(input_ids, seq_codes=seq_codes)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                val_loss += loss.item()
+            val_loss /= len(val_dataset)
+        # log to console and to file
+        monitor0.log_val(step+1, val_loss)
+
 
     # -------------------------------------------------------------------------
     # clean up nice

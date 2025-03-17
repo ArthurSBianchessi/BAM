@@ -10,30 +10,25 @@
 
 # python \
 export NCCL_P2P_DISABLE=1
-# export CUDA_VISIBLE_DEVICES=0,1,2,3
-# export CUDA_VISIBLE_DEVICES=1,2,3,4,5
-# export CUDA_VISIBLE_DEVICES=2,3,4,5
 # export CUDA_VISIBLE_DEVICES=0,1,2
-# export CUDA_VISIBLE_DEVICES=3,4,5
-# export CUDA_VISIBLE_DEVICES=0,1
-# export CUDA_VISIBLE_DEVICES=2,3
-# export CUDA_VISIBLE_DEVICES=4,5
-export CUDA_VISIBLE_DEVICES=0
-time torchrun --standalone --nproc_per_node 1 \
+# export CUDA_VISIBLE_DEVICES=1,2,3,4,5
+# export CUDA_VISIBLE_DEVICES=0,1,2
+export CUDA_VISIBLE_DEVICES=3,4,5
+export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=0,1
+time torchrun --standalone --nproc_per_node 2 \
     train.py \
-        --tokens_per_step=655360 \
-        --position_encoding='alibi' \
-        --model_size='l6' \
+        --dataset="10B" \
+        --log_dir="logs/tests/bam9/" \
+        --position_encoding='bam' \
         --sequence_length=1024 \
-        --batch_size=32 \
+        --batch_size=24 \
         --weight_decay=0.1  \
+        --model=l6 \
         --warmup_iters=400 \
         --learning_rate_decay_frac=0.1 \
         --compile=1 \
         --tensorcores=1 \
         --val_loss_every=32 \
         --dtype=bfloat16 \
-        # --shape_lr=1e-1 \
-        # --scale_lr=1e-1 \
-        # --loc_lr=1e-1 \
-

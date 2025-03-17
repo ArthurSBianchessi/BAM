@@ -30,11 +30,12 @@ class BATModelArgs:
     loc_init:   float = 0
 
     train_shape: bool = True
-    train_scale: bool = False
+    train_scale: bool = True
     train_loc:   bool = False
 
-    global_positional_encoding: bool = False
+    global_positional_encoding: bool = True
 
+# loc = exp(loc) - exp(-loc)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -61,6 +62,7 @@ class AttentionPrior(nn.Module):
             scale = torch.tensor(get_slopes(args.n_heads), dtype=torch.float).reshape(1, args.n_heads, 1, 1)
         else:
             scale = torch.full((1, args.n_heads, 1, 1), args.scale_init, dtype=torch.float)
+        scale = torch.log(scale)
         # self.register_buffer("scale", torch.tensor(get_slopes(args.n_heads)).reshape(1, args.n_heads, 1, 1))
         
         if args.train_shape and args.shape_init == 'linear':
@@ -100,8 +102,9 @@ class AttentionPrior(nn.Module):
         dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
         # return -(dist_matrix.abs() * self.scale).abs()
         # return -(dist_matrix * self.scale + self.loc).abs()
-        z = dist_matrix * self.scale + self.loc
-        return -( (z.abs()+self.eps)**self.shape )
+        loc = self.loc.exp() - (-self.loc).exp()
+        z = dist_matrix * self.scale.exp() + loc
+        return -((z.abs()+self.eps)**self.shape )
     
 
 def get_slopes(n):
