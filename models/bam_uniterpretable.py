@@ -103,7 +103,7 @@ class AttentionPrior(nn.Module):
         # return -(dist_matrix.abs() * self.scale).abs()
         # return -(dist_matrix * self.scale + self.loc).abs()
         loc = self.loc.exp() - (-self.loc).exp()
-        z = (dist_matrix - loc) * (-self.scale).exp()
+        z = dist_matrix * self.scale.exp() + loc
         return -((z.abs()+self.eps)**self.shape )
     
 
