@@ -3,4 +3,5 @@ data/*
 *.json
 *.pt
 *.pyc
+*.png
 __pycache__/
