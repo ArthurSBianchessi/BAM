@@ -161,7 +161,12 @@ class SinusoidalTransformer(nn.Module):
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        h = h + self.position_embeddings[:seqlen].to(h.device)
+        if seqlen <= self.position_embeddings.shape[1]:
+            h = h + self.position_embeddings[:, :seqlen].to(h.device)
+        else:
+            position_embeddings = self.sinusoidal_position_embeddings(seqlen, self.params.dim, self.params.sinusoidal_theta)
+            position_embeddings = position_embeddings.unsqueeze(0).to(h.device)
+            h = h + position_embeddings
 
         mask = None
         if seqlen > 1:

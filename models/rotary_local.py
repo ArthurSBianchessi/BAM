@@ -11,7 +11,7 @@ from torch import nn
 
 
 @dataclass
-class RotaryModelArgs:
+class LocalRotaryModelArgs:
     dim: int = 1024
     n_layers: int = 32
     n_heads: int = 32
@@ -81,7 +81,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: RotaryModelArgs):
+    def __init__(self, args: LocalRotaryModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
@@ -146,7 +146,7 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: RotaryModelArgs):
+    def __init__(self, layer_id: int, args: LocalRotaryModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -173,8 +173,8 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class RotaryTransformer(nn.Module):
-    def __init__(self, params: RotaryModelArgs):
+class LocalRotaryTransformer(nn.Module):
+    def __init__(self, params: LocalRotaryModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -214,6 +214,10 @@ class RotaryTransformer(nn.Module):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
 
             mask = torch.triu(mask, diagonal=1)
+
+            positions = torch.arange(seqlen, device=tokens.device).float()
+            local_mask = (positions[None, :] - positions[:, None]).abs() > self.params.max_seq_len
+            mask[local_mask] = float("-inf")
 
             if seq_codes is not None:
                 mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)

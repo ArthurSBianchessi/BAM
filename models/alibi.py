@@ -157,7 +157,8 @@ class ALiBiTransformer(nn.Module):
 
         # self.slopes = torch.tensor(self.get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1)
         # self.slopes = nn.Parameter(self.slopes)
-        self.register_buffer("slopes", torch.tensor(self.get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1), persistent=False)
+        slopes = self.get_slopes(params.n_heads)
+        self.register_buffer("slopes", torch.tensor(slopes).reshape(1, params.n_heads, 1, 1), persistent=False)
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
