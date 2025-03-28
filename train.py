@@ -45,8 +45,9 @@ from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
 from models.rotary import RotaryModelArgs, RotaryTransformer
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam import BATransformer, BATModelArgs
+from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
-from utils import print0, round_to_multiple, set_lr, DistributedShardedDataset, StateMonitor
+from utils import print0, round_to_multiple, set_lr, compute_radam_lr, DistributedShardedDataset, StateMonitor
 ########################################################################################
 ########################################################################################
 
@@ -70,9 +71,9 @@ if __name__ == "__main__":
     parser.add_argument("--shape_trainable", type=bool, default=True, help="trainable shape exponent for BAM")
     parser.add_argument("--scale_trainable", type=bool, default=True, help="trainable scale multiplier for BAM")
     parser.add_argument("--loc_trainable", type=bool, default=True, help="trainable location sum for BAM")
-    parser.add_argument("--shape_lr", type=float, default=1e-4, help="learning rate for shape exponent")
-    parser.add_argument("--scale_lr", type=float, default=1e-4, help="learning rate for scale multiplier")
-    parser.add_argument("--loc_lr", type=float, default=1e-4, help="learning rate for location sum")
+    parser.add_argument("--shape_lr", type=float, default=None, help="learning rate for shape exponent")
+    parser.add_argument("--scale_lr", type=float, default=None, help="learning rate for scale multiplier")
+    parser.add_argument("--loc_lr", type=float, default=None, help="learning rate for location sum")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -98,10 +99,12 @@ if __name__ == "__main__":
     # debugging
     parser.add_argument("--overfit_single_batch", type=bool, default=0, help="overfit just one batch of data")
     # numerics
-    parser.add_argument("--tensorcores", type=bool, default=0, help="use tensorcores")
+    # parser.add_argument("--tensorcores", type=bool, default=0, help="use tensorcores")
+    parser.add_argument("--tensorcores", action=argparse.BooleanOptionalAction, help="use tensorcores")
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
-    parser.add_argument("--compile", type=bool, default=0, help="torch.compile the model")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, help="torch.compile the model")
+    # parser.add_argument("--compile", type=bool, default=False, help="torch.compile the model")
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
 
     args = parser.parse_args()
@@ -110,7 +113,7 @@ if __name__ == "__main__":
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
-    assert args.position_encoding in {"rotary", "sinusoidal", "alibi", "bam"}
+    assert args.position_encoding in {"rotary", "sinusoidal", "alibi", "bam", "laplace"}
     # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
     assert sum([args.min_tokens_per_step is not None, 
                 args.tokens_per_step is not None, 
@@ -121,6 +124,13 @@ if __name__ == "__main__":
 
     if args.tokens_per_step is not None:
         assert args.tokens_per_step % (batch_size * seq_len) == 0
+
+    if args.shape_lr is None:
+        args.shape_lr = args.learning_rate
+    if args.scale_lr is None:
+        args.scale_lr = args.learning_rate
+    if args.loc_lr is None:
+        args.loc_lr = args.learning_rate
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -198,6 +208,7 @@ if __name__ == "__main__":
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
+        "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
     }[args.position_encoding]
 
     # init the model
@@ -205,9 +216,9 @@ if __name__ == "__main__":
         "l6":  ModelArgs(dim=512,  n_layers=6,  n_heads=16, ffn_dim_multiplier=2),
         "l8":  ModelArgs(dim=768,  n_layers=8,  n_heads=16, ffn_dim_multiplier=2),
         "l12": ModelArgs(dim=768,  n_layers=12, n_heads=16, ffn_dim_multiplier=2),
-        "l16": ModelArgs(dim=1024, n_layers=16, n_heads=16, ffn_dim_multiplier=2),
-        "l18": ModelArgs(dim=1536, n_layers=18, n_heads=16, ffn_dim_multiplier=2),
-        "l24": ModelArgs(dim=2048, n_layers=24, n_heads=16, ffn_dim_multiplier=2),
+        "l16": ModelArgs(dim=1024, n_layers=16, n_heads=32, ffn_dim_multiplier=2),
+        "l18": ModelArgs(dim=1536, n_layers=18, n_heads=32, ffn_dim_multiplier=2),
+        "l24": ModelArgs(dim=2048, n_layers=24, n_heads=64, ffn_dim_multiplier=2),
     }[args.model_size]
     model_config.max_seq_len = seq_len
     model_config.max_batch_size = batch_size
@@ -219,9 +230,6 @@ if __name__ == "__main__":
         model_config.train_scale = args.scale_trainable
         model_config.train_loc = args.loc_trainable
         model_config.global_positional_encoding = args.global_prior
-    # if args.position_encoding == "alibi":
-    #     model_config.scale_init = args.scale_init
-    #     model_config.train_scale = args.scale_trainable
 
     model = Transformer(model_config)
 
@@ -258,6 +266,7 @@ if __name__ == "__main__":
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+    raw_model = raw_model._orig_mod if args.compile else model
 
     # init the optimizer
     # optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, 
@@ -271,13 +280,19 @@ if __name__ == "__main__":
     # ]
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
-        {'params': [p for n, p in param_dict.items() if p.dim() >= 2 and 'prior' not in n], 'weight_decay': args.weight_decay, 'init_lr': args.learning_rate},
-        {'params': [p for n, p in param_dict.items() if p.dim() < 2  and 'prior' not in n], 'weight_decay': 0.0, 'init_lr': args.learning_rate},
-        {'params': [p for n, p in param_dict.items() if 'shape' in n], 'weight_decay': 0.0, 'lr': args.shape_lr, 'init_lr': args.shape_lr},
-        {'params': [p for n, p in param_dict.items() if 'scale' in n], 'weight_decay': 0.0, 'lr': args.scale_lr, 'init_lr': args.scale_lr},
-        {'params': [p for n, p in param_dict.items() if 'loc'   in n], 'weight_decay': 0.0, 'lr': args.loc_lr,   'init_lr': args.loc_lr},
+        {'params': [p for n, p in param_dict.items() if p.dim() >= 2 and 'prior' not in n], 'weight_decay': args.weight_decay,
+         'init_lr': args.learning_rate, 'lr': args.learning_rate},
+        {'params': [p for n, p in param_dict.items() if p.dim() < 2  and 'prior' not in n], 'weight_decay': 0.0, 
+         'init_lr': args.learning_rate, 'lr': args.learning_rate},
+        {'params': [p for n, p in param_dict.items() if 'shape' in n], 'weight_decay': 0.0, 'lr': args.shape_lr, 
+         'init_lr': args.shape_lr, 'lr': args.shape_lr},
+        {'params': [p for n, p in param_dict.items() if 'scale' in n], 'weight_decay': 0.0, 'lr': args.scale_lr, 
+         'init_lr': args.scale_lr, 'lr': args.scale_lr},
+        {'params': [p for n, p in param_dict.items() if 'loc'   in n], 'weight_decay': 0.0, 'lr': args.loc_lr,   
+         'init_lr': args.loc_lr, 'lr': args.loc_lr},
     ]
-    optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    optimizer = torch.optim.RAdam(optim_groups, betas=(0.9, 0.95), weight_decay=args.weight_decay, decoupled_weight_decay=True)
+    # optimizer = torch.optim.AdamW(optim_groups, betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
 
 
@@ -405,8 +420,12 @@ if __name__ == "__main__":
         # # determine and set the learning rate for this iteration
         optimizer = set_lr(optimizer, step, num_iterations, args)
         # lr = get_lr(step)
+        # all_lrs = set()
         # for param_group in optimizer.param_groups:
-        #     param_group['lr'] = lr
+        #     # param_group['lr'] = lr
+        #     # print(param_group['lr'], end='\t')
+        #     all_lrs.add(param_group['lr'])
+        # print(all_lrs)
         
         # step the optimizer
         if lossf == lossf: # check for NaN
@@ -425,7 +444,8 @@ if __name__ == "__main__":
             torch.cuda.synchronize()
         
         # log
-        monitor0.log(step, lossf, norm, optimizer.param_groups[0]['lr'])
+        # monitor0.log(step, lossf, norm, optimizer.param_groups[0]['lr'])
+        monitor0.log(step, lossf, norm, compute_radam_lr(optimizer))
         
     monitor0.save_model()
     monitor0.max_memory()

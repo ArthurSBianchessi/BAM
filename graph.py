@@ -15,7 +15,7 @@ class Grapher:
         # val = pd.read_csv(f'{path}/eval.log')
         # args = pd.read_csv(os.path.join(path, 'args.json'), index_col=0, keep_default_na=False, na_values=['NaN'])
         with open(os.path.join(path, 'args.json')) as f:
-            args = json.load(f)
+            args_json = json.load(f)
         args2 = {}
         # for key, value in args.items():
         #     if isinstance(value, dict):
@@ -23,8 +23,8 @@ class Grapher:
         #             args2[key+'_'+k] = v
         #     else:
         #         args2[key] = value
-        args2 = args['model_args']
-        args2['pos_enc'] = args['args']['position_encoding']
+        args2 = args_json['model_args']
+        args2['pos_enc'] = args_json['args']['position_encoding']
         args = pd.DataFrame(args2, index=[0]).T
         args.columns = ['value']
         
@@ -39,6 +39,9 @@ class Grapher:
         val['perplexity'] = 2**(val['loss'])
         train['perplexity'] = np.exp(train['loss'])
         val['perplexity'] = np.exp(val['loss'])
+
+        train['tokens'] = train['step']*args_json['dataset_args']['tokens_per_batch']
+        val['tokens'] = val['step']*args_json['dataset_args']['tokens_per_batch']
 
 
         self.diff = set()
@@ -191,11 +194,12 @@ class Grapher:
             id = 1
             for j in range(i+1, len(self.args)):
                 if self.train_dfs[i]['type'].loc[0] == self.train_dfs[j]['type'].loc[0]:
-                    self.train_dfs[i]['type'] += f'_0'
-                    self.val_dfs[i]['type'] += f'_0'
                     self.train_dfs[j]['type'] += f'_{id}'
                     self.val_dfs[j]['type'] += f'_{id}'
                     id += 1
+            if id > 1:
+                self.train_dfs[i]['type'] += f'_0'
+                self.val_dfs[i]['type'] += f'_0'
         self.type_list = []
         for i in range(len(self.args)):
             self.type_list.extend(self.train_dfs[i]['type'].unique())
