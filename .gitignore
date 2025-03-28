@@ -1,5 +1,6 @@
 data/*
 *.log
+*.json
 *.pt
 *.pyc
 __pycache__/
