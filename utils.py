@@ -190,11 +190,10 @@ def round_to_multiple(x, multiple=1, up=False):
 # learning rate decay scheduler (cosine with warmup)
 def set_lr(optimizer, it, num_iterations, args):
     for param_group in optimizer.param_groups:
-        # min_lr = args.learning_rate * args.learning_rate_decay_frac
         min_lr = param_group['init_lr'] * args.learning_rate_decay_frac
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
-            param_group['lr'] = args.learning_rate * (it+1) / args.warmup_iters
+            param_group['lr'] = param_group['init_lr'] * (it+1) / args.warmup_iters
             continue
         # 2) if it > lr_decay_iters, return min learning rate
         if it > num_iterations:
@@ -204,14 +203,49 @@ def set_lr(optimizer, it, num_iterations, args):
         decay_ratio = (it - args.warmup_iters) / (num_iterations - args.warmup_iters)
         assert 0 <= decay_ratio <= 1
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-        # return min_lr + coeff * (args.learning_rate - min_lr)
-        param_group['lr'] = param_group['init_lr'] + coeff * (args.learning_rate - min_lr)
-    # print(optimizer)
-    # print(optimizer.param_groups)
+        param_group['lr'] = min_lr + coeff * (param_group['init_lr'] - min_lr)
     return optimizer
 
+def compute_radam_lr(radam_optimizer):
+    def _compute_rect(rho_t, rho_inf):
+        return (
+            (rho_t - 4)
+            * (rho_t - 2)
+            * rho_inf
+            / ((rho_inf - 4) * (rho_inf - 2) * rho_t)
+        ) ** 0.5
 
 
+    step = radam_optimizer.state[radam_optimizer.param_groups[0]['params'][0]]['step'].item()
+    beta2 = radam_optimizer.param_groups[0]['betas'][1]
+    bias_correction2 = 1 - beta2**step
+
+    # maximum length of the approximated SMA
+    rho_inf = 2 / (1 - beta2) - 1
+    # compute the length of the approximated SMA
+    rho_t = rho_inf - 2 * step * (beta2**step) / bias_correction2
+
+    if rho_t > 5:
+        return _compute_rect(rho_t, rho_inf)*radam_optimizer.param_groups[0]['lr']
+    else:
+        return None
+
+
+
+# # learning rate decay scheduler (cosine with warmup)
+# def get_lr(it):
+#     min_lr = args.learning_rate * args.learning_rate_decay_frac
+#     # 1) linear warmup for warmup_iters steps
+#     if it < args.warmup_iters:
+#         return args.learning_rate * (it+1) / args.warmup_iters
+#     # 2) if it > lr_decay_iters, return min learning rate
+#     if it > num_iterations:
+#         return min_lr
+#     # 3) in between, use cosine decay down to min learning rate
+#     decay_ratio = (it - args.warmup_iters) / (num_iterations - args.warmup_iters)
+#     assert 0 <= decay_ratio <= 1
+#     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+#     return min_lr + coeff * (args.learning_rate - min_lr)
 class StateMonitor:
     # def __init__(self, log_dir='logs', rank=0, model_type=None, model_pos_enc=None, num_iterations=None, 
     #              tokens_per_batch=None, model=None, val_tokens=0):
@@ -289,6 +323,8 @@ class StateMonitor:
             string = f'{step},{runtime},{loss},{norm},{lr},{exec_time},{tokens_per_second}\n'
             with open(self.train_log_file, 'a') as f:
                 f.write(string)
+                
+            lr = lr if lr is not None else 0
             print(f"step {step+1:4d}/{self.num_iterations} | train loss {loss:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(exec_time):.2f} s | {tokens_per_second:.0f} tok/s)")
         
             if step % 1000 == 0:
