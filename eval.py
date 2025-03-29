@@ -112,6 +112,21 @@ class PromptGenerator:
     def generate_prompt(self, length):
         n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
         n_garbage_prefix = random.randint(0, n_garbage) if n_garbage > 0 else 0
+        return self.__generate_prompt(n_garbage, n_garbage_prefix)
+    
+    def generate_prompts(self, length, n_prompts):
+        prompts = []
+        passkeys = []
+        n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
+        paskeys_positions = torch.linspace(0, n_garbage-1, n_prompts).long()
+        for passkey_position in paskeys_positions:
+            n_garbage_prefix = passkey_position
+            prompt, passkey_tokens = self.__generate_prompt(n_garbage, n_garbage_prefix)
+            prompts.append(prompt)
+            passkeys.append(passkey_tokens)
+        return prompts, passkeys
+    
+    def __generate_prompt(self, n_garbage, n_garbage_prefix):
         n_garbage_suffix = n_garbage - n_garbage_prefix
 
         pass_key = random.randint(10**(self.n_digits-1), 10**self.n_digits-1)
@@ -125,29 +140,6 @@ class PromptGenerator:
 
         prompt = self.task_description_tokens + garbage_prefix + information_tokens + garbage_suffix + self.final_question_tokens
         return prompt, passkey_tokens
-    
-    def generate_prompts(self, length, n_prompts):
-        prompts = []
-        passkeys = []
-        n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
-        paskeys_positions = torch.linspace(0, n_garbage-1, n_prompts).long()
-        for passkey_position in paskeys_positions:
-            n_garbage_prefix = passkey_position
-            n_garbage_suffix = n_garbage - n_garbage_prefix
-
-            pass_key = random.randint(10**(self.n_digits-1), 10**self.n_digits-1)
-            information_line = self.information_line.format(pass_key=pass_key)
-
-            information_tokens  = self.tokenizer(information_line, add_special_tokens=False)['input_ids']
-            passkey_tokens      = self.tokenizer(' ' + str(pass_key), add_special_tokens=False)['input_ids']
-
-            garbage_prefix = self.garbage_inf_tokens * n_garbage_prefix
-            garbage_suffix = self.garbage_inf_tokens * n_garbage_suffix
-
-            prompt = self.task_description_tokens + garbage_prefix + information_tokens + garbage_suffix + self.final_question_tokens
-            prompts.append(prompt)
-            passkeys.append(passkey_tokens)
-        return prompts, passkeys
 
 
 def load_model(dir, comp=''):
