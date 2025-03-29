@@ -16,9 +16,6 @@ from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 class PasskeyEvaluator:
     def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=1):
-        # self.start = start or step
-        # self.end = end
-        # self.step = step
         self.seq_lens = seq_lens
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.generator = PromptGenerator(digits=pred_digits+preffix_digits)
@@ -32,33 +29,17 @@ class PasskeyEvaluator:
         accs = []
         seq_lens = []
         self.patience = patience
-        # for seq_len in range(self.start, self.end+1, self.step):
         for seq_len in self.seq_lens:
             correct = 0
             seq_lens.append(self.generator(seq_len)[0].size(-1) -self.pred_digits-self.preffix_digits-1)
             for i in range(sample_size):
-                # print(i, end='\r')
                 print(f'{i: 4d}/{sample_size}', end='\r')
                 tokens, pass_key = self.generator(seq_len)
-                # n_tokens = tokens
                 output = model(tokens.to(self.device))
-                # pred_pass_key = self.generator.tokenizer.decode(output.max(-1).indices[0][-6:-1])
-                # pred_pass_key = output.max(-1).indices[0][-7:-1].cpu()
                 pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
-                # pred_pass_key2 = output.max(-1).indices[0][-self.pred_digits-self.preffix_digits-3:].cpu()
                 pass_key = pass_key[0, self.preffix_digits+1:]
-                # print(pass_key)
-                # print(pass_key)
-                # print(pred_pass_key)
-                # print(self.generator.tokenizer.decode(pass_key[0]))
-                # print(self.generator.tokenizer.decode(pred_pass_key2))
-                # print(self.generator.tokenizer.decode(pass_key2))
-                # print(self.generator.tokenizer.decode(pred_pass_key))
-                # raise Exception
                 if (pred_pass_key == pass_key).all():
                     correct += 1
-                # else:
-                #     print(pred_pass_key, pass_key)
             accs.append(correct/sample_size)
             if verbose:
                 print(f"seq_len: {seq_len}, acc: {correct}/{sample_size}")
@@ -119,13 +100,11 @@ class PromptGenerator:
         n_garbage_prefix = random.randint(0, n_garbage) if n_garbage > 0 else 0
         n_garbage_suffix = n_garbage - n_garbage_prefix
 
-        # pass_key = random.randint(10_000, 99_999)
         pass_key = random.randint(10**(self.n_digits-1), 10**self.n_digits-1)
         information_line = self.information_line.format(pass_key=pass_key)
 
         information_tokens  = self.tokenizer(information_line, add_special_tokens=False)['input_ids']
         passkey_tokens      = self.tokenizer(' ' + str(pass_key), add_special_tokens=False)['input_ids']
-        # passkey_tokens      = self.tokenizer(' ' + str(pass_key) + '.', add_special_tokens=False)['input_ids']
 
         garbage_prefix = self.garbage_inf_tokens * n_garbage_prefix
         garbage_suffix = self.garbage_inf_tokens * n_garbage_suffix
@@ -153,11 +132,11 @@ def load_model(dir, comp=''):
     
     ModelArgs, Transformer = {
         "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
-        "rotary_local": (LocalRotaryModelArgs,       LocalRotaryTransformer       ),
+        "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
-        "laplace":      (LaplaceModelArgs,      LaplaceTransformer       ),
+        "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
     }[args['args']['position_encoding']]
     model_dict = torch.load(dir+f'model{comp}.pt')
     model = Transformer(ModelArgs(**args['model_args']))
