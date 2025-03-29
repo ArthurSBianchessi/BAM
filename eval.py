@@ -9,7 +9,8 @@ from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
 from models.rotary_local import LocalRotaryTransformer, LocalRotaryModelArgs
 from models.rotary import RotaryTransformer, RotaryModelArgs
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
-from models.bam import BATransformer, BATModelArgs
+from models.bam_uninterpretable import BATransformer0, BATModelArgs0
+from models.bam import BATransformer, BATModelArgs 
 from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 
@@ -24,8 +25,44 @@ class PasskeyEvaluator:
         self.preffix_digits = preffix_digits
 
     @torch.inference_mode()
-    def evaluate(self, model, sample_size=100, verbose=True, patience=3):
+    def evaluate(self, model, sample_size=100, verbose=True, random=False, patience=3):
+    # def evaluate(self, model, sample_size=100, verbose=True, random=False, patience=float('inf')):
         model.to(self.device)
+        if random:
+            return self._evaluate_random(model, sample_size, verbose, patience)
+        else:
+            return self._evaluate(model, sample_size, verbose, patience)
+        
+    def _evaluate(self, model, sample_size, verbose, patience):
+        accs = []
+        seq_lens = []
+        self.patience = patience
+        for seq_len in self.seq_lens:
+            correct = 0
+            # print(self.generator.generate_prompt(seq_len)[0])
+            seq_lens.append(len(self.generator.generate_prompt(seq_len)[0]) -self.pred_digits-self.preffix_digits-1)
+            prompts, passkeys = self.generator.generate_prompts(seq_len, sample_size)
+            for prompt, pass_key in zip(prompts, passkeys):
+                prompt = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
+                # pass_key = torch.tensor(pass_key).unsqueeze(0).to(self.device)
+                output = model(prompt)
+                pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
+                if (list(pred_pass_key) == pass_key[self.preffix_digits+1:]):
+                    correct += 1
+            accs.append(correct/sample_size)
+            if verbose:
+                print(f"seq_len: {seq_len}, acc: {correct}/{sample_size}")
+            if correct == 0:
+                patience -= 1
+            else:
+                patience = self.patience
+            if patience == 0:
+                print(f"Early stopping at seq_len: {seq_lens[-1]}")
+                break
+        return seq_lens, accs
+        
+
+    def _evaluate_random(self, model, sample_size, verbose, patience):
         accs = []
         seq_lens = []
         self.patience = patience
@@ -88,19 +125,29 @@ class PromptGenerator:
 
         prompt = self.task_description_tokens + garbage_prefix + information_tokens + garbage_suffix + self.final_question_tokens
         return prompt, passkey_tokens
-
-    def __call__(self, length, num_prompts=1, return_tensors=True):
+    
+    def generate_prompts(self, length, n_prompts):
         prompts = []
-        pass_keys = []
-        for _ in range(num_prompts):
-            prompt, pass_key = self.generate_prompt(length)
-            prompts.append(prompt + pass_key)
-            pass_keys.append(pass_key)
+        passkeys = []
+        n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
+        paskeys_positions = torch.linspace(0, n_garbage-1, n_prompts).long()
+        for passkey_position in paskeys_positions:
+            n_garbage_prefix = passkey_position
+            n_garbage_suffix = n_garbage - n_garbage_prefix
 
-        if return_tensors:
-            prompts = torch.tensor(prompts)
-            pass_keys = torch.tensor(pass_keys)
-        return prompts, pass_keys
+            pass_key = random.randint(10**(self.n_digits-1), 10**self.n_digits-1)
+            information_line = self.information_line.format(pass_key=pass_key)
+
+            information_tokens  = self.tokenizer(information_line, add_special_tokens=False)['input_ids']
+            passkey_tokens      = self.tokenizer(' ' + str(pass_key), add_special_tokens=False)['input_ids']
+
+            garbage_prefix = self.garbage_inf_tokens * n_garbage_prefix
+            garbage_suffix = self.garbage_inf_tokens * n_garbage_suffix
+
+            prompt = self.task_description_tokens + garbage_prefix + information_tokens + garbage_suffix + self.final_question_tokens
+            prompts.append(prompt)
+            passkeys.append(passkey_tokens)
+        return prompts, passkeys
 
 
 def load_model(dir, comp=''):
@@ -113,6 +160,7 @@ def load_model(dir, comp=''):
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
+        "bam_uninterpretable": (BATModelArgs0, BATransformer0),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
     }[args['args']['position_encoding']]
     model_dict = torch.load(dir+f'model{comp}.pt')
