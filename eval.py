@@ -16,42 +16,41 @@ from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 
 class PasskeyEvaluator:
-    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=1):
+    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=1, sampling='equidistant'):
         self.seq_lens = seq_lens
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.generator = PromptGenerator(digits=pred_digits+preffix_digits)
         self.device = device
         self.pred_digits = pred_digits
         self.preffix_digits = preffix_digits
+        self.sampling = sampling
 
     @torch.inference_mode()
-    def evaluate(self, model, sample_size=100, verbose=True, random=False, patience=3):
-    # def evaluate(self, model, sample_size=100, verbose=True, random=False, patience=float('inf')):
+    # def evaluate(self, model, sample_size=100, verbose=True, patience=3):
+    def evaluate(self, model, sample_size=100, verbose=True, patience=3):
         model.to(self.device)
-        if random:
-            return self._evaluate_random(model, sample_size, verbose, patience)
-        else:
-            return self._evaluate(model, sample_size, verbose, patience)
-        
-    def _evaluate(self, model, sample_size, verbose, patience):
         accs = []
         seq_lens = []
         self.patience = patience
         for seq_len in self.seq_lens:
             correct = 0
-            # print(self.generator.generate_prompt(seq_len)[0])
-            seq_lens.append(len(self.generator.generate_prompt(seq_len)[0]) -self.pred_digits-self.preffix_digits-1)
-            prompts, passkeys = self.generator.generate_prompts(seq_len, sample_size)
+            seq_lens.append(len(self.generator(seq_len)[0][0]))
+            prompts, passkeys = self.generator(seq_len, sample_size, self.sampling)
             for prompt, pass_key in zip(prompts, passkeys):
-                prompt = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
-                # pass_key = torch.tensor(pass_key).unsqueeze(0).to(self.device)
-                output = model(prompt)
+                if not len(prompt) == seq_lens[-1]:
+                    raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_lens[-1]}")
+                model_input = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
+                output = model(model_input)
                 pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
+                # print(self.generator.tokenizer.decode(pass_key))
+                # print(self.generator.tokenizer.decode(pred_pass_key))
+                # print()
                 if (list(pred_pass_key) == pass_key[self.preffix_digits+1:]):
                     correct += 1
             accs.append(correct/sample_size)
             if verbose:
-                print(f"seq_len: {seq_len}, acc: {correct}/{sample_size}")
+                print(f"seq_len: {len(prompt)}, acc: {correct/sample_size*100:04.1f}%")
+                # print(f"seq_len: {len(prompt)}, acc: {correct}/{sample_size}")
             if correct == 0:
                 patience -= 1
             else:
@@ -59,35 +58,9 @@ class PasskeyEvaluator:
             if patience == 0:
                 print(f"Early stopping at seq_len: {seq_lens[-1]}")
                 break
+        model.to('cpu')
         return seq_lens, accs
         
-
-    def _evaluate_random(self, model, sample_size, verbose, patience):
-        accs = []
-        seq_lens = []
-        self.patience = patience
-        for seq_len in self.seq_lens:
-            correct = 0
-            seq_lens.append(self.generator(seq_len)[0].size(-1) -self.pred_digits-self.preffix_digits-1)
-            for i in range(sample_size):
-                print(f'{i: 4d}/{sample_size}', end='\r')
-                tokens, pass_key = self.generator(seq_len)
-                output = model(tokens.to(self.device))
-                pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
-                pass_key = pass_key[0, self.preffix_digits+1:]
-                if (pred_pass_key == pass_key).all():
-                    correct += 1
-            accs.append(correct/sample_size)
-            if verbose:
-                print(f"seq_len: {seq_len}, acc: {correct}/{sample_size}")
-            if correct == 0:
-                patience -= 1
-            else:
-                patience = self.patience
-            if patience == 0:
-                print(f"Early stopping at seq_len: {seq_lens[-1]}")
-                break
-        return seq_lens, accs
 
 
 class PromptGenerator:
@@ -109,22 +82,22 @@ class PromptGenerator:
         self.final_question_len     = len(self.final_question_tokens)
         self.n_digits               = digits
 
-    def generate_prompt(self, length):
-        n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
-        n_garbage_prefix = random.randint(0, n_garbage) if n_garbage > 0 else 0
-        return self.__generate_prompt(n_garbage, n_garbage_prefix)
+    # def generate_prompt(self, length):
+    #     n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
+    #     n_garbage_prefix = random.randint(0, n_garbage) if n_garbage > 0 else 0
+    #     return self.__generate_prompt(n_garbage, n_garbage_prefix)
     
-    def generate_prompts(self, length, n_prompts):
-        prompts = []
-        passkeys = []
-        n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
-        paskeys_positions = torch.linspace(0, n_garbage-1, n_prompts).long()
-        for passkey_position in paskeys_positions:
-            n_garbage_prefix = passkey_position
-            prompt, passkey_tokens = self.__generate_prompt(n_garbage, n_garbage_prefix)
-            prompts.append(prompt)
-            passkeys.append(passkey_tokens)
-        return prompts, passkeys
+    # def generate_prompts(self, length, n_prompts):
+    #     prompts = []
+    #     passkeys = []
+    #     n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
+    #     paskeys_positions = torch.linspace(0, n_garbage-1, n_prompts).long()
+    #     for passkey_position in paskeys_positions:
+    #         n_garbage_prefix = passkey_position
+    #         prompt, passkey_tokens = self.__generate_prompt(n_garbage, n_garbage_prefix)
+    #         prompts.append(prompt)
+    #         passkeys.append(passkey_tokens)
+    #     return prompts, passkeys
     
     def __generate_prompt(self, n_garbage, n_garbage_prefix):
         n_garbage_suffix = n_garbage - n_garbage_prefix
@@ -140,6 +113,33 @@ class PromptGenerator:
 
         prompt = self.task_description_tokens + garbage_prefix + information_tokens + garbage_suffix + self.final_question_tokens
         return prompt, passkey_tokens
+    
+    def generate_prompt(self, length, sample_size=1, sampling='random'):
+        prompts = []
+        passkeys = []
+        n_garbage = (length -self.task_description_len -self.information_line_len -self.final_question_len) // self.garbage_inf_len
+        n_garbage = max(n_garbage, 0)
+        if sampling == 'random':
+            passkey_positions = random.choices(range(n_garbage+1), k=sample_size)
+        elif sampling == 'equidistant':
+            passkey_positions = torch.linspace(0, n_garbage, sample_size).long().tolist()
+        elif sampling == 'beginning':
+            passkey_positions = [0] * sample_size
+        elif sampling == 'end':
+            passkey_positions = [n_garbage] * sample_size
+        else:
+            raise ValueError(f"Unknown sampling method: {sampling}")
+        for passkey_position in passkey_positions:
+            prompt, passkey_tokens = self.__generate_prompt(n_garbage, passkey_position)
+            prompts.append(prompt)
+            passkeys.append(passkey_tokens)
+        return prompts, passkeys
+    
+    def __call__(self, length, sample_size=1, sampling='random'):
+        return self.generate_prompt(length, sample_size, sampling)
+
+
+    
 
 
 def load_model(dir, comp=''):

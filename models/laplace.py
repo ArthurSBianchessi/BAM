@@ -22,6 +22,7 @@ class LaplaceModelArgs:
     norm_eps: float = 1e-5
     max_batch_size: int = 32
     max_seq_len: int = 1024
+    uniform_heads: int = 0
 
 
 class RMSNorm(torch.nn.Module):
@@ -157,8 +158,13 @@ class LaplaceTransformer(nn.Module):
 
         # self.slopes = torch.tensor(self.get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1)
         # self.slopes = nn.Parameter(self.slopes)
-        slopes = self.get_slopes(params.n_heads)
-        slopes[-1] = 0
+        # slopes = self.get_slopes(params.n_heads)
+        # slopes[-1] = 0
+        # slopes[-2] = 0
+        # slopes = self.get_slopes(params.n_heads-4) + [0,0,0,0]
+        # slopes = self.get_slopes(params.n_heads-2) + [0,0]
+        slopes = self.get_slopes(params.n_heads-params.uniform_heads) + params.uniform_heads*[0]
+        print(slopes)
         self.register_buffer("slopes", torch.tensor(slopes).reshape(1, params.n_heads, 1, 1), persistent=False)
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):

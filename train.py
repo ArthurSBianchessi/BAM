@@ -65,6 +65,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_size", type=str, default="l12", help="l6|l8|l12|l16|l24|l32")
     # Bayesian Attention Mechanism specific arguments
     parser.add_argument("--global_prior", type=bool, default=True, help="whether to use a global prior for BAM (True|False)")
+    # parser.add_argument("--compile", action=argparse.BooleanOptionalAction, help="torch.compile the model")
+    # argparse.BooleanOptionalAction but deffault to true
+    # parser.add_argument("--global_prior",  
     parser.add_argument("--shape_init", type=str, default=1, help="initial shape exponent for BAM, either a string, float or a list of floats")
     parser.add_argument("--scale_init", type=str, default='slope', help="initial scale multiplier for BAM, either a string, float or a list of floats")
     parser.add_argument("--loc_init", type=str, default=0, help="initial location sum for BAM, either a string, float or a list of floats")
@@ -74,6 +77,7 @@ if __name__ == "__main__":
     parser.add_argument("--shape_lr", type=float, default=None, help="learning rate for shape exponent")
     parser.add_argument("--scale_lr", type=float, default=None, help="learning rate for scale multiplier")
     parser.add_argument("--loc_lr", type=float, default=None, help="learning rate for location sum")
+    parser.add_argument("--laplace_uniform_heads", type=int, default=0, help="number of uniform heads for Laplace attention")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -108,6 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
 
     args = parser.parse_args()
+    print(args.global_prior)
 
     # args error checking and convenience variables
     batch_size, seq_len = args.batch_size, args.sequence_length
@@ -230,6 +235,8 @@ if __name__ == "__main__":
         model_config.train_scale = args.scale_trainable
         model_config.train_loc = args.loc_trainable
         model_config.global_positional_encoding = args.global_prior
+    if args.position_encoding == "laplace":
+        model_config.uniform_heads = args.laplace_uniform_heads
 
     model = Transformer(model_config)
 

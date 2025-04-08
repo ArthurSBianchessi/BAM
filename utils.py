@@ -327,7 +327,7 @@ class StateMonitor:
             lr = lr if lr is not None else 0
             print(f"step {step+1:4d}/{self.num_iterations} | train loss {loss:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(exec_time):.2f} s | {tokens_per_second:.0f} tok/s)")
         
-            if step % 1000 == 0:
+            if step % 500 == 0:
                 # checkpoint(self.model, rank=self.rank)
                 self.save_model()
                 self.save_optimizer()
