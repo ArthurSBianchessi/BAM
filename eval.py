@@ -11,6 +11,7 @@ from models.rotary import RotaryTransformer, RotaryModelArgs
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam_uninterpretable import BATransformer0, BATModelArgs0
 from models.bam import BATransformer, BATModelArgs 
+from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
 from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 
@@ -145,16 +146,15 @@ class PromptGenerator:
 def load_model(dir, comp=''):
     with open(dir+'args.json') as f:
         args = json.load(f)
-    
+
     ModelArgs, Transformer = {
         "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
-        "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
-        "bam_uninterpretable": (BATModelArgs0, BATransformer0),
+        "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
-    }[args['args']['position_encoding']]
+    }[args.position_encoding]
     model_dict = torch.load(dir+f'model{comp}.pt')
     model = Transformer(ModelArgs(**args['model_args']))
     model_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in model_dict.items()}
