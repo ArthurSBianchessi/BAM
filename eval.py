@@ -154,7 +154,7 @@ def load_model(dir, comp=''):
         "bam":          (BATModelArgs,          BATransformer           ),
         "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
-    }[args.position_encoding]
+    }[args['args']['position_encoding']]
     model_dict = torch.load(dir+f'model{comp}.pt')
     model = Transformer(ModelArgs(**args['model_args']))
     model_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in model_dict.items()}
