@@ -57,7 +57,7 @@ class DistributedShardedDataset(IterableDataset):
 
         # glob files that match the pattern
         self.files = sorted(os.listdir(f"data/{dataset_dir}"))
-        self.files = [f"data/{dataset_dir}/{f}" for f in self.files]
+        self.files = [f"data/{dataset_dir}/{f}" for f in self.files][:2]
         # self.files = ['data/10B/sample_000000.pt', 'data/10B/sample_000001.pt']
         assert len(self.files) > 0, f"did not find any files that match the pattern {dataset_dir}"
 

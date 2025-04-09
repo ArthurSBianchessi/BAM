@@ -45,6 +45,7 @@ from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
 from models.rotary import RotaryModelArgs, RotaryTransformer
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam import BATransformer, BATModelArgs
+from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
 from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 from utils import print0, round_to_multiple, set_lr, compute_radam_lr, DistributedShardedDataset, StateMonitor
@@ -77,6 +78,7 @@ if __name__ == "__main__":
     parser.add_argument("--shape_lr", type=float, default=None, help="learning rate for shape exponent")
     parser.add_argument("--scale_lr", type=float, default=None, help="learning rate for scale multiplier")
     parser.add_argument("--loc_lr", type=float, default=None, help="learning rate for location sum")
+    parser.add_argument("--no_seq_scale", action=argparse.BooleanOptionalAction, help="whether to disable the SSMax sequence scale in BAM")
     parser.add_argument("--laplace_uniform_heads", type=int, default=0, help="number of uniform heads for Laplace attention")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
@@ -118,7 +120,7 @@ if __name__ == "__main__":
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
-    assert args.position_encoding in {"rotary", "sinusoidal", "alibi", "bam", "laplace"}
+    assert args.position_encoding in {"rotary", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace"}
     # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
     assert sum([args.min_tokens_per_step is not None, 
                 args.tokens_per_step is not None, 
@@ -213,6 +215,7 @@ if __name__ == "__main__":
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
+        "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
     }[args.position_encoding]
 
@@ -227,7 +230,7 @@ if __name__ == "__main__":
     }[args.model_size]
     model_config.max_seq_len = seq_len
     model_config.max_batch_size = batch_size
-    if args.position_encoding == "bam":
+    if args.position_encoding in ["bam", "bam_ssmax"]:
         model_config.shape_init = args.shape_init
         model_config.scale_init = args.scale_init
         model_config.loc_init = args.loc_init
@@ -235,6 +238,8 @@ if __name__ == "__main__":
         model_config.train_scale = args.scale_trainable
         model_config.train_loc = args.loc_trainable
         model_config.global_positional_encoding = args.global_prior
+    if args.position_encoding == "bam_ssmax":
+        model_config.seq_scale = not args.no_seq_scale
     if args.position_encoding == "laplace":
         model_config.uniform_heads = args.laplace_uniform_heads
 
@@ -287,15 +292,15 @@ if __name__ == "__main__":
     # ]
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     optim_groups = [
-        {'params': [p for n, p in param_dict.items() if p.dim() >= 2 and 'prior' not in n], 'weight_decay': args.weight_decay,
+        {'params': [p for n, p in param_dict.items() if p.squeeze().dim() >= 2 and 'prior' not in n], 'weight_decay': args.weight_decay,
          'init_lr': args.learning_rate, 'lr': args.learning_rate},
-        {'params': [p for n, p in param_dict.items() if p.dim() < 2  and 'prior' not in n], 'weight_decay': 0.0, 
+        {'params': [p for n, p in param_dict.items() if p.squeeze().dim() < 2  and 'prior' not in n], 'weight_decay': 0.0, 
          'init_lr': args.learning_rate, 'lr': args.learning_rate},
-        {'params': [p for n, p in param_dict.items() if 'shape' in n], 'weight_decay': 0.0, 'lr': args.shape_lr, 
+        {'params': [p for n, p in param_dict.items() if 'prior.shape' in n], 'weight_decay': 0.0, 'lr': args.shape_lr, 
          'init_lr': args.shape_lr, 'lr': args.shape_lr},
-        {'params': [p for n, p in param_dict.items() if 'scale' in n], 'weight_decay': 0.0, 'lr': args.scale_lr, 
+        {'params': [p for n, p in param_dict.items() if 'prior.scale' in n], 'weight_decay': 0.0, 'lr': args.scale_lr, 
          'init_lr': args.scale_lr, 'lr': args.scale_lr},
-        {'params': [p for n, p in param_dict.items() if 'loc'   in n], 'weight_decay': 0.0, 'lr': args.loc_lr,   
+        {'params': [p for n, p in param_dict.items() if 'prior.loc'   in n], 'weight_decay': 0.0, 'lr': args.loc_lr,   
          'init_lr': args.loc_lr, 'lr': args.loc_lr},
     ]
     optimizer = torch.optim.RAdam(optim_groups, betas=(0.9, 0.95), weight_decay=args.weight_decay, decoupled_weight_decay=True)
