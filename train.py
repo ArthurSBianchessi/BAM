@@ -73,9 +73,9 @@ if __name__ == "__main__":
     parser.add_argument("--shape_init", type=str, default=1, help="initial shape exponent for BAM, either a string, float or a list of floats")
     parser.add_argument("--scale_init", type=str, default='slope', help="initial scale multiplier for BAM, either a string, float or a list of floats")
     parser.add_argument("--loc_init", type=str, default=0, help="initial location sum for BAM, either a string, float or a list of floats")
-    parser.add_argument("--shape_trainable", type=bool, default=True, help="trainable shape exponent for BAM")
-    parser.add_argument("--scale_trainable", type=bool, default=True, help="trainable scale multiplier for BAM")
-    parser.add_argument("--loc_trainable", type=bool, default=True, help="trainable location sum for BAM")
+    parser.add_argument("--shape_trainable", type=int, default=1, help="trainable shape exponent for BAM")
+    parser.add_argument("--scale_trainable", type=int, default=1, help="trainable scale multiplier for BAM")
+    parser.add_argument("--loc_trainable", type=int, default=1, help="trainable location sum for BAM")
     parser.add_argument("--shape_lr", type=float, default=None, help="learning rate for shape exponent")
     parser.add_argument("--scale_lr", type=float, default=None, help="learning rate for scale multiplier")
     parser.add_argument("--loc_lr", type=float, default=None, help="learning rate for location sum")
@@ -115,7 +115,13 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
 
     args = parser.parse_args()
-    print(args.no_seq_scale)
+    # print(args.global_prior)
+    args.shape_trainable = bool(args.shape_trainable)
+    args.scale_trainable = bool(args.scale_trainable)
+    args.loc_trainable = bool(args.loc_trainable)
+    print(f'Train Shape:  {args.shape_trainable}')
+    print(f'Train Scale:  {args.scale_trainable}')
+    print(f'Train Loc:    {args.loc_trainable}')
 
     # args error checking and convenience variables
     batch_size, seq_len = args.batch_size, args.sequence_length
