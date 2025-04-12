@@ -17,7 +17,7 @@ from models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 
 class PasskeyEvaluator:
-    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=1, sampling='equidistant'):
+    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant'):
         self.seq_lens = seq_lens
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.generator = PromptGenerator(digits=pred_digits+preffix_digits)
@@ -28,7 +28,7 @@ class PasskeyEvaluator:
 
     @torch.inference_mode()
     # def evaluate(self, model, sample_size=100, verbose=True, patience=3):
-    def evaluate(self, model, sample_size=100, verbose=True, patience=3):
+    def evaluate(self, model, sample_size=100, verbose=True, patience=float('inf')):
         model.to(self.device)
         accs = []
         seq_lens = []
@@ -149,11 +149,13 @@ def load_model(dir, comp=''):
 
     ModelArgs, Transformer = {
         "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
+        "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
         "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
+        "bam_uninterpretable": (BATModelArgs0, BATransformer0),
     }[args['args']['position_encoding']]
     model_dict = torch.load(dir+f'model{comp}.pt')
     model = Transformer(ModelArgs(**args['model_args']))
