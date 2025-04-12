@@ -281,7 +281,7 @@ class SSMaxBATransformer(nn.Module):
 
                 section_log_len = torch.tril(~section_mask, diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
             else:
-                section_log_len = torch.tril(torch.ones_like(section_mask), diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
+                section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
 
 
             if self.global_positional_encoding:
