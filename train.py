@@ -43,6 +43,7 @@ import torch.distributed as dist
 # from models.model import Transformer, ModelArgs
 from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
 from models.rotary import RotaryModelArgs, RotaryTransformer
+from models.rotary_ssmax import RotarySSMaxModelArgs, RotarySSMaxTransformer
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam import BATransformer, BATModelArgs
 from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
@@ -114,13 +115,13 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
 
     args = parser.parse_args()
-    print(args.global_prior)
+    print(args.no_seq_scale)
 
     # args error checking and convenience variables
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
-    assert args.position_encoding in {"rotary", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace"}
+    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace"}
     # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
     assert sum([args.min_tokens_per_step is not None, 
                 args.tokens_per_step is not None, 
@@ -212,6 +213,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     ModelArgs, Transformer = {
         "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
+        "rotary_ssmax": (RotarySSMaxModelArgs,  RotarySSMaxTransformer  ),
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),

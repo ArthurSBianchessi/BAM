@@ -11,7 +11,7 @@ from torch import nn
 
 
 @dataclass
-class RotaryModelArgs:
+class RotarySSMaxModelArgs:
     dim: int = 1024
     n_layers: int = 32
     n_heads: int = 32
@@ -24,6 +24,7 @@ class RotaryModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
+    seq_scale: bool = True
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -55,7 +56,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
-def apply_rotary_emb(
+def apply_rotarySSMax_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -81,7 +82,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: RotaryModelArgs):
+    def __init__(self, args: RotarySSMaxModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
@@ -94,11 +95,15 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+        self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
@@ -107,7 +112,7 @@ class Attention(nn.Module):
         keys = keys.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         values = values.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        queries, keys = apply_rotary_emb(queries, keys, freqs_cis=freqs_cis)
+        queries, keys = apply_rotarySSMax_emb(queries, keys, freqs_cis=freqs_cis)
 
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -115,6 +120,7 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = scores * section_log_len * self.seq_scale
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
@@ -146,7 +152,7 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: RotaryModelArgs):
+    def __init__(self, layer_id: int, args: RotarySSMaxModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -167,14 +173,15 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
     ):
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, section_log_len)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
-class RotaryTransformer(nn.Module):
-    def __init__(self, params: RotaryModelArgs):
+class RotarySSMaxTransformer(nn.Module):
+    def __init__(self, params: RotarySSMaxModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -220,11 +227,15 @@ class RotaryTransformer(nn.Module):
                 section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
                 mask[section_mask] = float("-inf")
                 mask = mask.unsqueeze(-3)
+
+                section_log_len = torch.tril(~section_mask, diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
+            else:
+                section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
                 
             mask = mask.type_as(h)
 
         for layer in self.layers:
-            h = layer(h, freqs_cis, mask)
+            h = layer(h, freqs_cis, mask, section_log_len)
         h = self.norm(h)
         output = self.output(h).float()
         return output
