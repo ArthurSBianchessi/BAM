@@ -98,12 +98,17 @@ class Attention(nn.Module):
         seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
         self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
 
+
+        self.cache_k = torch.zeros((1, 8192, self.n_local_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((1, 8192, self.n_local_kv_heads, self.head_dim))
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         section_log_len: Optional[torch.Tensor] = None,
+        start_pos: Optional[int] = 0,
     ):
         bsz, seqlen, _ = x.shape
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
@@ -114,11 +119,26 @@ class Attention(nn.Module):
 
         queries, keys = apply_rotarySSMax_emb(queries, keys, freqs_cis=freqs_cis)
 
+
+        self.cache_k = self.cache_k.to(x.device)
+        self.cache_v = self.cache_v.to(x.device)
+        if self.cache_k.size(1) < seqlen+start_pos:
+            new_size = max(seqlen+start_pos, self.cache_k.size(1)*2)
+            temp_cache_k = torch.zeros((1, new_size, self.n_local_kv_heads, self.head_dim), device=x.device)
+            temp_cache_v = torch.zeros((1, new_size, self.n_local_kv_heads, self.head_dim), device=x.device)
+            temp_cache_k[:, :self.cache_k.size(1), :, :] = self.cache_k
+            temp_cache_v[:, :self.cache_v.size(1), :, :] = self.cache_v
+            self.cache_k = temp_cache_k
+            self.cache_v = temp_cache_v
+        self.cache_k[:, start_pos:start_pos+seqlen, :, :] = keys
+        self.cache_v[:, start_pos:start_pos+seqlen, :, :] = values
+        keys = self.cache_k[:, :start_pos+seqlen, :, :]
+        values = self.cache_v[:, :start_pos+seqlen, :, :]
+
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         scores = scores * section_log_len * self.seq_scale
         if mask is not None:
@@ -174,8 +194,9 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
         section_log_len: Optional[torch.Tensor] = None,
+        start_pos: Optional[int] = 0,
     ):
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, section_log_len)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, section_log_len, start_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -202,40 +223,40 @@ class RotarySSMaxTransformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        if seqlen < 2*self.params.max_seq_len:
-            self.freqs_cis = self.freqs_cis.to(h.device)
-            freqs_cis = self.freqs_cis[:seqlen]
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None):
+        _bsz, full_seqlen = tokens.shape
+        full_h = self.tok_embeddings(tokens)
+        if full_seqlen < 2*self.params.max_seq_len:
+            self.freqs_cis = self.freqs_cis.to(full_h.device)
+            full_freqs_cis = self.freqs_cis[:full_seqlen]
         else:
-            freqs_cis = precompute_freqs_cis(
+            full_freqs_cis = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
-                seqlen,
+                full_seqlen,
                 self.params.rope_theta,
             )
-            freqs_cis = freqs_cis.to(h.device)
+            full_freqs_cis = full_freqs_cis.to(full_h.device)
 
-        mask = None
-        if seqlen > 1:
+        if seq_batch_size is None:
+            seq_batch_size = full_seqlen
+        for start_pos in range(0, full_seqlen, seq_batch_size):
+            h = full_h[:, start_pos:start_pos+seq_batch_size, :]
+            freqs_cis = full_freqs_cis[start_pos:start_pos+seq_batch_size]
+            
+            # h = full_h[:, start_pos:start_pos+seq_batch_size, :]
+            _bsz, seqlen, h_dim = h.shape
+            mask = None
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
+            if start_pos > 0:
+                mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask])
 
-            if seq_codes is not None:
-                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
-                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
-                mask[section_mask] = float("-inf")
-                mask = mask.unsqueeze(-3)
+            section_log_len = mask.isfinite().float().sum(-1, keepdim=True).log().unsqueeze(-3)
 
-                section_log_len = torch.tril(~section_mask, diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
-            else:
-                section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
-                
             mask = mask.type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, freqs_cis, mask, section_log_len)
-        h = self.norm(h)
-        output = self.output(h).float()
+            for layer in self.layers:
+                h = layer(h, freqs_cis, mask, section_log_len, start_pos)
+            h = self.norm(h)
+            output = self.output(h).float()
         return output
