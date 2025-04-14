@@ -5,19 +5,20 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
-from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
-from models.rotary_local import LocalRotaryTransformer, LocalRotaryModelArgs
-from models.rotary import RotaryTransformer, RotaryModelArgs
-from models.alibi import ALiBiModelArgs, ALiBiTransformer
-from models.bam_uninterpretable import BATransformer0, BATModelArgs0
-from models.bam import BATransformer, BATModelArgs 
-from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
-from models.laplace import LaplaceTransformer, LaplaceModelArgs
+from inference_models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
+from inference_models.rotary_local import LocalRotaryTransformer, LocalRotaryModelArgs
+from inference_models.rotary_ssmax import RotarySSMaxModelArgs, RotarySSMaxTransformer
+from inference_models.rotary import RotaryTransformer, RotaryModelArgs
+from inference_models.alibi import ALiBiModelArgs, ALiBiTransformer
+from inference_models.bam_uninterpretable import BATransformer0, BATModelArgs0
+from inference_models.bam import BATransformer, BATModelArgs 
+from inference_models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
+from inference_models.laplace import LaplaceTransformer, LaplaceModelArgs
 
 
 
 class PasskeyEvaluator:
-    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant'):
+    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant', patience=float('inf')):
         self.seq_lens = seq_lens
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.generator = PromptGenerator(digits=pred_digits+preffix_digits)
@@ -25,14 +26,15 @@ class PasskeyEvaluator:
         self.pred_digits = pred_digits
         self.preffix_digits = preffix_digits
         self.sampling = sampling
+        self.patience = patience
 
     @torch.inference_mode()
     # def evaluate(self, model, sample_size=100, verbose=True, patience=3):
-    def evaluate(self, model, sample_size=100, verbose=True, patience=float('inf')):
+    def evaluate(self, model, sample_size=100, verbose=True, patience=None):
         model.to(self.device)
         accs = []
         seq_lens = []
-        self.patience = patience
+        patience = patience or self.patience
         for seq_len in self.seq_lens:
             correct = 0
             seq_lens.append(len(self.generator(seq_len)[0][0]))
@@ -41,7 +43,8 @@ class PasskeyEvaluator:
                 if not len(prompt) == seq_lens[-1]:
                     raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_lens[-1]}")
                 model_input = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
-                output = model(model_input)
+                # output = model(model_input)
+                output = model(model_input, seq_batch_size=1024)
                 pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
                 # print(self.generator.tokenizer.decode(pass_key))
                 # print(self.generator.tokenizer.decode(pred_pass_key))
@@ -150,6 +153,7 @@ def load_model(dir, comp=''):
     ModelArgs, Transformer = {
         "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
         "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
+        "rotary_ssmax": (RotarySSMaxModelArgs,  RotarySSMaxTransformer  ),
         "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
         "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
         "bam":          (BATModelArgs,          BATransformer           ),
