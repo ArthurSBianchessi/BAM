@@ -16,6 +16,8 @@ parser.add_argument("-v", "--version", type=str, default="10B", help="Fineweb da
 parser.add_argument("-n", "--tokenizer", type=str, default="mistralai/Mistral-7B-Instruct-v0.3", help="HuggingFace tokenizer")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each data shard in the output .pt files, in tokens")
 parser.add_argument("-b", "--batch_size", type=int, default=2**16, help="Size of each data shard in the output .pt files, in tokens")
+parser.add_argument("--no_streaming", action=argparse.BooleanOptionalAction, help="Use streaming mode for loading the dataset")
+# parser.add_argument("--num_proc", type=int, default=1, help="Number of processes to use for loading the dataset")
 args = parser.parse_args()
 
 
@@ -33,7 +35,7 @@ dataset_dir, local_dir, name = directories[(args.type, args.version)]
 os.makedirs(f'./data/{local_dir}', exist_ok=True)
 # ------------------------------------------
 
-def tokenize_shard(start, end, dataset, tokenizer, dtype):
+def tokenize_shard(sentences, tokenizer, dtype):
     tokens = tokenizer(dataset[start:end]['text'], padding=False, truncation=False, return_length=True)
     token_count = sum(tokens['length'])
     all_input_ids = []
@@ -52,8 +54,11 @@ def write_datafile(filename, input_ids, seq_codes, tokenizer_name):
     }
     torch.save(data_dict, filename)
 
+if not args.no_streaming:
+    print("Streaming mode is enabled.")
+
 print('Loading dataset')
-dataset = load_dataset(dataset_dir, name=name, split="train")
+dataset = load_dataset(dataset_dir, name=name, split="train", streaming=not args.no_streaming)
 
 print('Loading tokenizer')
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, add_eos_token=True)
@@ -68,8 +73,15 @@ progress_bar.update(args.batch_size)
 current_pos = args.batch_size
 shard_index = 0
 token_count = 0
-while current_pos < len(dataset):
+# while current_pos < len(dataset):
+while True:
     if len(input_ids) < args.shard_size:
+        sentences = []
+        for i in range(65536):
+            try:
+                sentences.append(next(dataset)['text'])
+            except StopIteration:
+                break
         new_input_ids, new_seq_codes, current_token_count = tokenize_shard(current_pos, current_pos+args.batch_size, dataset, tokenizer, token_dtype)
         token_count += current_token_count
         input_ids = torch.cat((input_ids, new_input_ids), dim=0)
