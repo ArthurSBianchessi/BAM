@@ -11,7 +11,7 @@ from torch import nn
 
 
 @dataclass
-class LaplaceModelArgs:
+class LaplaceSSMaxModelArgs:
     dim: int = 1024
     n_layers: int = 32
     n_heads: int = 32
@@ -22,7 +22,9 @@ class LaplaceModelArgs:
     norm_eps: float = 1e-5
     max_batch_size: int = 32
     max_seq_len: int = 1024
-    uniform_heads: int = 0
+    uniform_heads: int = 1
+
+    seq_scale: bool = True
 
 
 class RMSNorm(torch.nn.Module):
@@ -52,7 +54,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: LaplaceModelArgs):
+    def __init__(self, args: LaplaceSSMaxModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
@@ -65,10 +67,14 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+        self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
+
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
@@ -83,6 +89,8 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if section_log_len is not None:
+            scores = scores * section_log_len * self.seq_scale
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
@@ -114,7 +122,7 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: LaplaceModelArgs):
+    def __init__(self, layer_id: int, args: LaplaceSSMaxModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -134,14 +142,15 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
     ):
-        h = x + self.attention(self.attention_norm(x), mask)
+        h = x + self.attention(self.attention_norm(x), mask, section_log_len)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
-class LaplaceTransformer(nn.Module):
-    def __init__(self, params: LaplaceModelArgs):
+class LaplaceSSMaxTransformer(nn.Module):
+    def __init__(self, params: LaplaceSSMaxModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
@@ -183,6 +192,10 @@ class LaplaceTransformer(nn.Module):
                 section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
                 mask[section_mask] = float("-inf")
                 mask = mask.unsqueeze(-3)
+
+                section_log_len = torch.tril(~section_mask, diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
+            else:
+                section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
             
 
             positions = torch.arange(seqlen, device=tokens.device).float()
@@ -192,7 +205,7 @@ class LaplaceTransformer(nn.Module):
             mask = mask.type_as(h)
 
         for layer in self.layers:
-            h = layer(h, mask)
+            h = layer(h, mask, section_log_len)
         h = self.norm(h)
         output = self.output(h).float()
         return output

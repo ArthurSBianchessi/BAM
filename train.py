@@ -48,6 +48,7 @@ from models.alibi import ALiBiModelArgs, ALiBiTransformer
 from models.bam import BATransformer, BATModelArgs
 from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
 from models.laplace import LaplaceTransformer, LaplaceModelArgs
+from models.laplace_ssmax import LaplaceSSMaxTransformer, LaplaceSSMaxModelArgs
 
 from utils import print0, round_to_multiple, set_lr, compute_radam_lr, DistributedShardedDataset, StateMonitor
 ########################################################################################
@@ -80,7 +81,7 @@ if __name__ == "__main__":
     parser.add_argument("--scale_lr", type=float, default=None, help="learning rate for scale multiplier")
     parser.add_argument("--loc_lr", type=float, default=None, help="learning rate for location sum")
     parser.add_argument("--no_seq_scale", action=argparse.BooleanOptionalAction, help="whether to disable the SSMax sequence scale in BAM")
-    parser.add_argument("--laplace_uniform_heads", type=int, default=0, help="number of uniform heads for Laplace attention")
+    parser.add_argument("--laplace_uniform_heads", type=int, default=1, help="number of uniform heads for Laplace attention")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -127,7 +128,7 @@ if __name__ == "__main__":
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
-    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace"}
+    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace", "laplace_ssmax"}
     # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
     assert sum([args.min_tokens_per_step is not None, 
                 args.tokens_per_step is not None, 
@@ -225,6 +226,7 @@ if __name__ == "__main__":
         "bam":          (BATModelArgs,          BATransformer           ),
         "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
+        "laplace_ssmax":(LaplaceSSMaxModelArgs, LaplaceSSMaxTransformer ),
     }[args.position_encoding]
 
     # init the model
@@ -238,7 +240,7 @@ if __name__ == "__main__":
     }[args.model_size]
     model_config.max_seq_len = seq_len
     model_config.max_batch_size = batch_size
-    if args.position_encoding in ["bam", "bam_ssmax"]:
+    if "bam" in args.position_encoding:
         model_config.shape_init = args.shape_init
         model_config.scale_init = args.scale_init
         model_config.loc_init = args.loc_init
@@ -246,9 +248,9 @@ if __name__ == "__main__":
         model_config.train_scale = args.scale_trainable
         model_config.train_loc = args.loc_trainable
         model_config.global_positional_encoding = args.global_prior
-    if args.position_encoding == "bam_ssmax":
+    if "ssmax" in args.position_encoding:
         model_config.seq_scale = not args.no_seq_scale
-    if args.position_encoding == "laplace":
+    if "laplace" in args.position_encoding:
         model_config.uniform_heads = args.laplace_uniform_heads
 
     model = Transformer(model_config)
