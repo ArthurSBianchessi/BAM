@@ -174,7 +174,8 @@ class BayesianAttention(nn.Module):
         # print(scores.shape)
         # print(section_log_len.shape)
         # print(self.seq_scale.shape)
-        scores = scores * section_log_len * self.seq_scale
+        if section_log_len is not None:
+            scores = scores * section_log_len * self.seq_scale
         if self.local_positional_encoding:
             scores = scores + self.prior(seqlen)
         if mask is not None:

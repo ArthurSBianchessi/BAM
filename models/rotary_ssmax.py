@@ -120,7 +120,8 @@ class Attention(nn.Module):
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        scores = scores * section_log_len * self.seq_scale
+        if section_log_len is not None:
+            scores = scores * section_log_len * self.seq_scale
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
