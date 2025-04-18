@@ -14,6 +14,7 @@ from inference_models.bam_uninterpretable import BATransformer0, BATModelArgs0
 from inference_models.bam import BATransformer, BATModelArgs 
 from inference_models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
 from inference_models.laplace import LaplaceTransformer, LaplaceModelArgs
+from models.nope import NoPEModelArgs, NoPETransformer
 
 
 
@@ -43,8 +44,8 @@ class PasskeyEvaluator:
                 if not len(prompt) == seq_lens[-1]:
                     raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_lens[-1]}")
                 model_input = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
-                # output = model(model_input)
-                output = model(model_input, seq_batch_size=1024)
+                output = model(model_input)
+                # output = model(model_input, seq_batch_size=1024)
                 pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
                 # print(self.generator.tokenizer.decode(pass_key))
                 # print(self.generator.tokenizer.decode(pred_pass_key))
@@ -159,6 +160,7 @@ def load_model(dir, comp=''):
         "bam":          (BATModelArgs,          BATransformer           ),
         "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
+        "nope":         (NoPEModelArgs,         NoPETransformer         ),
         "bam_uninterpretable": (BATModelArgs0, BATransformer0),
     }[args['args']['position_encoding']]
     model_dict = torch.load(dir+f'model{comp}.pt')

@@ -49,6 +49,7 @@ from models.bam import BATransformer, BATModelArgs
 from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
 from models.laplace import LaplaceTransformer, LaplaceModelArgs
 from models.laplace_ssmax import LaplaceSSMaxTransformer, LaplaceSSMaxModelArgs
+from models.nope import NoPEModelArgs, NoPETransformer
 
 from utils import print0, round_to_multiple, set_lr, compute_radam_lr, DistributedShardedDataset, StateMonitor
 ########################################################################################
@@ -128,7 +129,7 @@ if __name__ == "__main__":
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
-    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace", "laplace_ssmax"}
+    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace", "laplace_ssmax", "nope"}
     # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
     assert sum([args.min_tokens_per_step is not None, 
                 args.tokens_per_step is not None, 
@@ -227,6 +228,7 @@ if __name__ == "__main__":
         "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
         "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
         "laplace_ssmax":(LaplaceSSMaxModelArgs, LaplaceSSMaxTransformer ),
+        "nope":         (NoPEModelArgs,         NoPETransformer         ),
     }[args.position_encoding]
 
     # init the model
