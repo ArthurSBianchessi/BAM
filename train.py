@@ -138,9 +138,6 @@ if __name__ == "__main__":
                 args.val_tokens is not None, 
                 args.min_val_tokens is not None]) <= 1, "only one of max_val_tokens, val_tokens, min_val_tokens can be set"
 
-    if args.tokens_per_step is not None:
-        assert args.tokens_per_step % (batch_size * seq_len) == 0
-
     if args.shape_lr is None:
         args.shape_lr = args.learning_rate
     if args.scale_lr is None:
@@ -185,6 +182,7 @@ if __name__ == "__main__":
         grad_accum_steps = round_to_multiple(args.min_tokens_per_step, multiple=tokens_per_fwdbwd, up=True) // tokens_per_fwdbwd
     elif args.tokens_per_step is not None:
         grad_accum_steps = args.tokens_per_step // tokens_per_fwdbwd
+        assert args.tokens_per_step % tokens_per_fwdbwd == 0, f"tokens_per_step {args.tokens_per_step} must be a multiple of {tokens_per_fwdbwd}"
     elif args.max_tokens_per_step is not None:
         grad_accum_steps = round_to_multiple(args.max_tokens_per_step, multiple=tokens_per_fwdbwd, down=True) // tokens_per_fwdbwd
     tokens_per_batch = tokens_per_fwdbwd * grad_accum_steps
