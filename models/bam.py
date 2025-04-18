@@ -61,21 +61,25 @@ class AttentionPrior(nn.Module):
         if args.scale_init == 'slope':
             scale = torch.tensor(get_slopes(args.n_heads), dtype=torch.float).reshape(1, args.n_heads, 1, 1)
         else:
-            scale = torch.full((1, args.n_heads, 1, 1), args.scale_init, dtype=torch.float)
+            scale = torch.full((1, args.n_heads, 1, 1), float(args.scale_init), dtype=torch.float)
         scale = torch.log(scale)
         # self.register_buffer("scale", torch.tensor(get_slopes(args.n_heads)).reshape(1, args.n_heads, 1, 1))
         
         if args.train_shape and args.shape_init == 'linear':
             shape  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
         elif args.train_shape:
-            shape   = torch.full((1, args.n_heads, 1, 1), args.shape_init, dtype=torch.float)
+            shape   = torch.full((1, args.n_heads, 1, 1), float(args.shape_init), dtype=torch.float)
         else:
             shape   = torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
-        loc     = torch.full((1, args.n_heads, 1, 1), args.loc_init,   dtype=torch.float)
+
+        loc     = torch.full((1, args.n_heads, 1, 1), float(args.loc_init),   dtype=torch.float)
         
         self.shape = nn.Parameter(shape, requires_grad = args.train_shape)
         self.scale = nn.Parameter(scale, requires_grad = args.train_scale)
         self.loc   = nn.Parameter(loc,   requires_grad = args.train_loc)
+        print0('Shape:', shape.flatten())
+        print0('Scale:', scale.flatten())
+        print0('Loc:', loc.flatten()) 
 
 
         # positions = torch.arange(self.seq_len).float()
