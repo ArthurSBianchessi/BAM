@@ -11,11 +11,11 @@ from transformers import AutoTokenizer
 # ------------------------------------------
 
 parser = argparse.ArgumentParser(description="FineWeb and Edu-FineWeb dataset preprocessing")
-parser.add_argument("-t", "--type", type=str, default="classic", help="Fineweb type, edu|classic")
-parser.add_argument("-v", "--version", type=str, default="10B", help="Fineweb data sample size, 10B|100B")
-parser.add_argument("-n", "--tokenizer", type=str, default="mistralai/Mistral-7B-Instruct-v0.3", help="HuggingFace tokenizer")
-parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each data shard in the output .pt files, in tokens")
-parser.add_argument("-b", "--batch_size", type=int, default=2**16, help="Size of each data shard in the output .pt files, in tokens")
+parser.add_argument("--type", type=str, default="classic", help="Fineweb type, edu|classic")
+parser.add_argument("--version", type=str, default="10B", help="Fineweb data sample size, 10B|100B")
+parser.add_argument("--tokenizer", type=str, default="mistralai/Mistral-7B-Instruct-v0.3", help="HuggingFace tokenizer")
+parser.add_argument("--shard_size", type=int, default=10**8, help="Size of each data shard in the output .pt files, in tokens")
+parser.add_argument("--batch_size", type=int, default=2**16, help="Size of each data shard in the output .pt files, in tokens")
 parser.add_argument("--no_streaming", action=argparse.BooleanOptionalAction, help="Use streaming mode for loading the dataset")
 # parser.add_argument("--num_proc", type=int, default=1, help="Number of processes to use for loading the dataset")
 args = parser.parse_args()
@@ -35,15 +35,17 @@ dataset_dir, local_dir, name = directories[(args.type, args.version)]
 os.makedirs(f'./data/{local_dir}', exist_ok=True)
 # ------------------------------------------
 
-def tokenize_shard(sentences, tokenizer, dtype):
-    tokens = tokenizer(dataset[start:end]['text'], padding=False, truncation=False, return_length=True)
+def tokenize_batch(sentences, tokenizer, dtype, start):
+    tokens = tokenizer(sentences, padding=False, truncation=False, return_length=True)
     token_count = sum(tokens['length'])
     all_input_ids = []
     all_seq_codes = []
     for i in range(len(tokens['input_ids'])):
         all_input_ids.extend(tokens['input_ids'][i])
-        all_seq_codes.append(torch.full((len(tokens['input_ids'][i]),), start+i, dtype=torch.int32))
-    return torch.tensor(all_input_ids, dtype=dtype), torch.concat(all_seq_codes), token_count
+        # all_seq_codes.append(torch.full((len(tokens['input_ids'][i]),), (start+i)%2**16, dtype=torch.uint16))
+        all_seq_codes.extend([(start+i)%2**16] * len(tokens['input_ids'][i]))
+    # return torch.tensor(all_input_ids, dtype=dtype), torch.concat(all_seq_codes, dtype=torch.uint16), token_count
+    return torch.tensor(all_input_ids, dtype=dtype), torch.tensor(all_seq_codes, dtype=torch.uint16), token_count
 
 
 def write_datafile(filename, input_ids, seq_codes, tokenizer_name):
@@ -59,62 +61,46 @@ if not args.no_streaming:
 
 print('Loading dataset')
 dataset = load_dataset(dataset_dir, name=name, split="train", streaming=not args.no_streaming)
+batched_dataset = dataset.batch(batch_size=args.batch_size)
 
 print('Loading tokenizer')
 tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, add_eos_token=True)
 
 token_dtype = torch.uint16 if tokenizer.vocab_size < 2**16 else torch.uint32
 
-print('Loading First Shard')
-progress_bar = tqdm(total=len(dataset), unit="File", desc=f"Shard {0}")
-input_ids, seq_codes, token_count = tokenize_shard(0, args.batch_size, dataset, tokenizer, token_dtype)
-progress_bar.update(args.batch_size)
-
-current_pos = args.batch_size
+# print('Loading First Shard')
+# input_ids, seq_codes, token_count = tokenize_batch(0, args.batch_size, dataset, tokenizer, token_dtype)
+input_ids = torch.empty(0, dtype=token_dtype)
+seq_codes = torch.empty(0, dtype=torch.uint16)
 shard_index = 0
 token_count = 0
-# while current_pos < len(dataset):
-while True:
-    if len(input_ids) < args.shard_size:
-        sentences = []
-        for i in range(65536):
-            try:
-                sentences.append(next(dataset)['text'])
-            except StopIteration:
-                break
-        new_input_ids, new_seq_codes, current_token_count = tokenize_shard(current_pos, current_pos+args.batch_size, dataset, tokenizer, token_dtype)
-        token_count += current_token_count
-        input_ids = torch.cat((input_ids, new_input_ids), dim=0)
-        seq_codes = torch.cat((seq_codes, new_seq_codes), dim=0)
-
-        if current_pos+args.batch_size < len(dataset):
-            progress_bar.update(args.batch_size)
-            current_pos += args.batch_size
-        else:
-            progress_bar.update(len(dataset) - current_pos)
-            current_pos = len(dataset)
-    else:
+print()
+for i, batch in enumerate(batched_dataset):
+    print(f"Processing document {i*args.batch_size:10d}      Shard {shard_index:6d}      Total Count: {token_count:20,}", end='\r')
+    new_input_ids, new_seq_codes, current_token_count = tokenize_batch(batch['text'], tokenizer, token_dtype, i*args.batch_size)
+    token_count += current_token_count
+    input_ids = torch.cat((input_ids, new_input_ids), dim=0)
+    seq_codes = torch.cat((seq_codes, new_seq_codes), dim=0)
+    while len(input_ids) > args.shard_size:
         filename = os.path.join(f'./data/{local_dir}', f"sample_{shard_index:06d}.pt")
         write_datafile(filename, input_ids[:args.shard_size], seq_codes[:args.shard_size], args.tokenizer)
         shard_index += 1
 
-        # Update progress bar description
-        progress_bar.set_description(f"Shard {shard_index}")
-
         # populate the next shard with the leftovers of the current doc
         input_ids = input_ids[args.shard_size:]
         seq_codes = seq_codes[args.shard_size:]
+        print()
 
 
 if len(input_ids) != 0:
     filename = os.path.join(f'./data/{local_dir}', f"sample_{shard_index:06d}.pt")
     write_datafile(filename, input_ids, seq_codes, args.tokenizer)
     shard_index += 1
-    progress_bar.update(len(input_ids))
 sleep(10)
 print("Done")
 print(f"Total shards: {shard_index}")
 print(f"Total tokens: {token_count}")
+sleep(10)
 
 
 
