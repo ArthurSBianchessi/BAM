@@ -21,7 +21,7 @@ from models.nope import NoPEModelArgs, NoPETransformer
 class PasskeyEvaluator:
     def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant', patience=float('inf')):
         self.seq_lens = seq_lens
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.generator = PromptGenerator(digits=pred_digits+preffix_digits)
         self.device = device
         self.pred_digits = pred_digits
@@ -37,24 +37,27 @@ class PasskeyEvaluator:
         seq_lens = []
         patience = patience or self.patience
         for seq_len in self.seq_lens:
+            print(f"0/0 correct", end='\r')
             correct = 0
             seq_lens.append(len(self.generator(seq_len)[0][0]))
             prompts, passkeys = self.generator(seq_len, sample_size, self.sampling)
-            for prompt, pass_key in zip(prompts, passkeys):
+            for i, (prompt, pass_key) in enumerate(zip(prompts, passkeys)):
+            # for prompt, pass_key in zip(prompts, passkeys):
                 if not len(prompt) == seq_lens[-1]:
                     raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_lens[-1]}")
                 model_input = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
-                output = model(model_input)
-                # output = model(model_input, seq_batch_size=1024)
+                # output = model(model_input)
+                output = model(model_input, seq_batch_size=64)
                 pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
                 # print(self.generator.tokenizer.decode(pass_key))
                 # print(self.generator.tokenizer.decode(pred_pass_key))
                 # print()
                 if (list(pred_pass_key) == pass_key[self.preffix_digits+1:]):
                     correct += 1
+                print(f"seq_len: {len(prompt)}, acc: {correct}/{i+1} of {sample_size}", end='\r')
             accs.append(correct/sample_size)
             if verbose:
-                print(f"seq_len: {len(prompt)}, acc: {correct/sample_size*100:04.1f}%")
+                print(f"seq_len: {len(prompt)}, acc: {correct/sample_size*100:04.1f}%                           ")
                 # print(f"seq_len: {len(prompt)}, acc: {correct}/{sample_size}")
             if correct == 0:
                 patience -= 1
