@@ -63,7 +63,6 @@ class AttentionPrior(nn.Module):
         else:
             scale = torch.full((1, args.n_heads, 1, 1), float(args.scale_init), dtype=torch.float)
         scale = torch.log(scale)
-        # self.register_buffer("scale", torch.tensor(get_slopes(args.n_heads)).reshape(1, args.n_heads, 1, 1))
         
         if args.train_shape and args.shape_init == 'linear':
             shape  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
