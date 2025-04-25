@@ -4,6 +4,7 @@ import random
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
+from time import time
 
 from inference_models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
 from inference_models.rotary_local import LocalRotaryTransformer, LocalRotaryModelArgs
@@ -31,33 +32,39 @@ class PasskeyEvaluator:
 
     @torch.inference_mode()
     # def evaluate(self, model, sample_size=100, verbose=True, patience=3):
-    def evaluate(self, model, sample_size=100, verbose=True, patience=None):
+    def evaluate(self, model, sample_size=10, verbose=True, patience=None):
         model.to(self.device)
         accs = []
         seq_lens = []
         patience = patience or self.patience
+        print(8)
         for seq_len in self.seq_lens:
-            print(f"0/0 correct", end='\r')
+            print(f"                0/0 correct", end='\r')
             correct = 0
             seq_lens.append(len(self.generator(seq_len)[0][0]))
             prompts, passkeys = self.generator(seq_len, sample_size, self.sampling)
+            start = time()
             for i, (prompt, pass_key) in enumerate(zip(prompts, passkeys)):
             # for prompt, pass_key in zip(prompts, passkeys):
                 if not len(prompt) == seq_lens[-1]:
                     raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_lens[-1]}")
                 model_input = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
                 # output = model(model_input)
-                output = model(model_input, seq_batch_size=64)
-                pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
+                output = model(model_input, seq_batch_size=8)
+                # output = model(model_input, seq_batch_size=32)
+                # pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
+                pred_pass_key = output[0, -self.pred_digits-1:-1].cpu()
                 # print(self.generator.tokenizer.decode(pass_key))
                 # print(self.generator.tokenizer.decode(pred_pass_key))
                 # print()
                 if (list(pred_pass_key) == pass_key[self.preffix_digits+1:]):
                     correct += 1
-                print(f"seq_len: {len(prompt)}, acc: {correct}/{i+1} of {sample_size}", end='\r')
+                end = time()
+                # print(f"seq_len: {len(prompt)}, acc: {correct}/{i+1} of {sample_size}", end='\r')
+                print(f"                seq_len: {len(prompt)}, acc: {correct}/{i+1} of {sample_size} took {(end-start)/(i+1):.2f}s", end='\r')
             accs.append(correct/sample_size)
             if verbose:
-                print(f"seq_len: {len(prompt)}, acc: {correct/sample_size*100:04.1f}%                           ")
+                print(f"seq_len: {len(prompt)}, acc: {correct/sample_size*100:04.1f}%                                                                                        ")
                 # print(f"seq_len: {len(prompt)}, acc: {correct}/{sample_size}")
             if correct == 0:
                 patience -= 1
@@ -150,24 +157,145 @@ class PromptGenerator:
     
 
 
-def load_model(dir, comp=''):
-    with open(dir+'args.json') as f:
-        args = json.load(f)
 
-    ModelArgs, Transformer = {
-        "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
-        "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
-        "rotary_ssmax": (RotarySSMaxModelArgs,  RotarySSMaxTransformer  ),
-        "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
-        "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
-        "bam":          (BATModelArgs,          BATransformer           ),
-        "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
-        "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
-        "nope":         (NoPEModelArgs,         NoPETransformer         ),
-        "bam_uninterpretable": (BATModelArgs0, BATransformer0),
-    }[args['args']['position_encoding']]
-    model_dict = torch.load(dir+f'model{comp}.pt')
-    model = Transformer(ModelArgs(**args['model_args']))
-    model_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in model_dict.items()}
-    model.load_state_dict(model_dict)
-    return model
+
+class PerplexityEvaluator:
+    def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, window_pos='middle'):
+        self.dataset_dir    = os.path.join('data', dataset_dir)
+        self.seq_len        = seq_len
+        self.ntokens        = ntokens
+        self.window_size    = window_size
+        self.window_pos     = window_pos
+        self.nwindows       = int(seq_len // window_size)
+        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction='none')
+
+        assert seq_len % window_size == 0, f"seq_len {seq_len} must be divisible by window_size {window_size}"
+
+        self.tokens         = self.get_val_set()
+        # glob files that match the pattern
+        file = sorted(os.listdir(self.dataset_dir))[0]
+        filename = os.path.join(self.dataset_dir, file)
+        assert len(self.files) > 0, f"did not find any files that match the pattern {self.dataset_dir}"
+
+        dataset = torch.load(filename)
+        tokens     = dataset['input_ids'][:ntokens]
+
+        # Identify EOS and BOS tokens 
+        tokenizer      = AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3')
+        eos_token_id   = tokenizer.eos_token_id
+        bos_token_id   = tokenizer.bos_token_id
+
+        # Remove EOS and BOS tokens from the dataset
+        eos_idxs = tokens == eos_token_id
+        bos_idxs = tokens == bos_token_id
+        idxs = eos_idxs | bos_idxs
+        tokens = tokens[~idxs]
+
+        nbatches = len(tokens) // seq_len
+        tokens = tokens[:nbatches * seq_len]
+        self.tokens = tokens.reshape(nbatches, seq_len)
+
+    def evaluate(self, model, prev_results=None):
+        if prev_results is not None:
+            perplexity = prev_results['perplexity']
+            positions = prev_results['positions']
+            return positions, perplexity
+        entropies = torch.zeros(self.nwindows)
+        for i, tokens in enumerate(self.tokens):
+            output = model(tokens.unsqueeze(0))
+            entropies += self.cross_entropy(output[:, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu()
+        entropies /= len(self.tokens)
+        perplexity = torch.exp(entropies)
+
+        positions = torch.arange(self.nwindows) * self.window_size
+        if self.window_pos == 'start':
+            pass
+        elif self.window_pos == 'middle':
+            positions += self.window_size // 2
+        elif self.window_pos == 'end':
+            positions += self.window_size - 1
+        else:
+            raise ValueError(f"Unknown window position: {self.window_pos}")
+        return positions.tolist(), perplexity.tolist()
+    
+class Evaluator:
+    # def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, window_pos='middle'):
+    # def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant', patience=float('inf')):
+    def __init__(self,
+                 passkey_seq_lens=None,
+                 passkey_sample_size=10,
+                 passkey_pred_digits=5,
+                 passkey_preffix_digits=0,
+                 passkey_samplings=['equidistant', 'beginning'],
+                 passkey_patience=float('inf'),
+                 perplexity_dataset_dir='10B',
+                 perplexity_seq_len=10_240,
+                 perplexity_ntokens=3_932_160,
+                 window_size=512,
+                 window_pos='middle',
+                 device='cpu',
+                 ):
+        self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000, 
+                                                     20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000, 
+                                                     200_000, 300_000, 400_000, 500_000]
+        self.passkey_evaluator = PasskeyEvaluator(
+            seq_lens=self.passkey_seq_lens,
+            device=device,
+            pred_digits=passkey_pred_digits,
+            preffix_digits=passkey_preffix_digits,
+            sampling=passkey_samplings[0],
+            patience=passkey_patience
+        )
+        self.perplexity_evaluator = PerplexityEvaluator(
+            dataset_dir=perplexity_dataset_dir,
+            seq_len=perplexity_seq_len,
+            ntokens=perplexity_ntokens,
+            window_size=window_size,
+            window_pos=window_pos
+        )
+        self.device = device
+
+    def evaluate(self, model_dir, evals=['passkey', 'perplexity']):
+        model = self.load_model(model_dir)
+        results = self.load_results(model_dir)
+
+
+
+        if 'passkey' in evals:
+            passkey_lens, passkey_accs = self.passkey_evaluator.evaluate(model, sample_size=self.passkey_sample_size, prev_results=results['passkey'])
+
+        if 'perplexity' in evals:
+            perplexity_lens, perplexity_accs = self.perplexity_evaluator.evaluate(model, prev_results=results['perplexity'])
+        
+
+
+    def load_model(self, dir):
+        with open(dir+'args.json') as f:
+            args = json.load(f)
+
+        ModelArgs, Transformer = {
+            "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
+            "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
+            "rotary_ssmax": (RotarySSMaxModelArgs,  RotarySSMaxTransformer  ),
+            "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
+            "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
+            "bam":          (BATModelArgs,          BATransformer           ),
+            "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
+            "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
+            "nope":         (NoPEModelArgs,         NoPETransformer         ),
+            "bam_uninterpretable": (BATModelArgs0, BATransformer0),
+        }[args['args']['position_encoding']]
+        # model_dict = torch.load(dir+f'model{comp}.pt')
+        model_dict = torch.load(os.path.join(dir, f'model.pt'))
+        model = Transformer(ModelArgs(**args['model_args']))
+        model_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in model_dict.items()}
+        model.load_state_dict(model_dict)
+        return model
+    
+    def load_results(self, dir):
+        if os.path.exists(os.path.join(dir, 'results.json')):
+            with open(os.path.join(dir, 'results.json')) as f:
+                results = json.load(f)
+        else:
+            results = {}
+        return results
