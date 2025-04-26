@@ -304,4 +304,5 @@ class BATransformer(nn.Module):
                 full_output.append(output)
             else:
                 full_output.append(output.argmax(-1))
+        output = torch.cat(full_output, dim=1)
         return output
