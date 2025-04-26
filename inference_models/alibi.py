@@ -160,23 +160,15 @@ class ALiBiTransformer(nn.Module):
         slopes = self.get_slopes(params.n_heads)
         self.register_buffer("slopes", torch.tensor(slopes).reshape(1, params.n_heads, 1, 1), persistent=False)
 
-    def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
-
-
-            if seq_codes is not None:
-                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
-                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
-                mask[section_mask] = float("-inf")
-                mask = mask.unsqueeze(-3)
-            
 
             positions = torch.arange(seqlen, device=tokens.device).float()
             position_encodings = -(positions[None, :] - positions[:, None]).abs() * self.slopes
@@ -188,7 +180,10 @@ class ALiBiTransformer(nn.Module):
             h = layer(h, mask)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        if return_logits:
+            return output
+        else:
+            return output.argmax(-1)
     
     def get_slopes(self, n):
         if math.log2(n).is_integer():

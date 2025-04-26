@@ -195,7 +195,8 @@ class LocalRotaryTransformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         if seqlen < 2*self.params.max_seq_len:
@@ -212,18 +213,11 @@ class LocalRotaryTransformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
 
             positions = torch.arange(seqlen, device=tokens.device).float()
             local_mask = (positions[None, :] - positions[:, None]).abs() > self.params.max_seq_len
             mask[local_mask] = float("-inf")
-
-            if seq_codes is not None:
-                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
-                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
-                mask[section_mask] = float("-inf")
-                mask = mask.unsqueeze(-3)
                 
             mask = mask.type_as(h)
 
@@ -231,4 +225,8 @@ class LocalRotaryTransformer(nn.Module):
             h = layer(h, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+        
+        if return_logits:
+            return output
+        else:
+            return output.argmax(-1)

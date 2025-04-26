@@ -223,9 +223,12 @@ class RotarySSMaxTransformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None):
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
         _bsz, full_seqlen = tokens.shape
         full_h = self.tok_embeddings(tokens)
+        full_output = []
+
         if full_seqlen < 2*self.params.max_seq_len:
             self.freqs_cis = self.freqs_cis.to(full_h.device)
             full_freqs_cis = self.freqs_cis[:full_seqlen]
@@ -259,4 +262,9 @@ class RotarySSMaxTransformer(nn.Module):
                 h = layer(h, freqs_cis, mask, section_log_len, start_pos)
             h = self.norm(h)
             output = self.output(h).float()
+            if return_logits:
+                full_output.append(output)
+            else:
+                full_output.append(output.argmax(-1))
+        output = torch.cat(full_output, dim=1)
         return output

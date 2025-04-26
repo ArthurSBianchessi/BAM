@@ -195,7 +195,8 @@ class RotaryTransformer(nn.Module):
             params.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         if seqlen < 2*self.params.max_seq_len:
@@ -212,19 +213,15 @@ class RotaryTransformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
-
-            if seq_codes is not None:
-                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
-                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
-                mask[section_mask] = float("-inf")
-                mask = mask.unsqueeze(-3)
-                
             mask = mask.type_as(h)
 
         for layer in self.layers:
             h = layer(h, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+
+        if return_logits:
+            return output
+        else:
+            return output.argmax(dim=-1)

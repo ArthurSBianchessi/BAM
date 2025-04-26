@@ -158,7 +158,8 @@ class SinusoidalTransformer(nn.Module):
         # self.register_buffer("position_embeddings", 
         #     self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta))
 
-    def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         if seqlen <= self.position_embeddings.shape[1]:
@@ -171,22 +172,18 @@ class SinusoidalTransformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
-
-            if seq_codes is not None:
-                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
-                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
-                mask[section_mask] = float("-inf")
-                mask = mask.unsqueeze(-3)
-                
             mask = mask.type_as(h)
 
         for layer in self.layers:
             h = layer(h, mask)
         h = self.norm(h)
         output = self.output(h).float()
-        return output
+
+        if return_logits:
+            return output
+        else:
+            return output.argmax(-1)
     
     def sinusoidal_position_embeddings(self, num_embeddings, embedding_dim, theta=10_000):
         embedding = torch.zeros(num_embeddings, embedding_dim)

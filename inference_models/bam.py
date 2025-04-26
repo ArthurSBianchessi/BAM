@@ -275,9 +275,10 @@ class BATransformer(nn.Module):
         # self.register_buffer("slopes", torch.tensor(get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1))
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None):
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
         _bsz, seqlen = tokens.shape
         full_h = self.tok_embeddings(tokens)
+        full_output = []
 
         if seq_batch_size is None:
             seq_batch_size = seqlen
@@ -299,4 +300,8 @@ class BATransformer(nn.Module):
                 h = layer(h, mask, start_pos)
             h = self.norm(h)
             output = self.output(h).float()
+            if return_logits:
+                full_output.append(output)
+            else:
+                full_output.append(output.argmax(-1))
         return output
