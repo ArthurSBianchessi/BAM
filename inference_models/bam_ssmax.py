@@ -149,8 +149,11 @@ class BayesianAttention(nn.Module):
         seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
         self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
 
-        self.cache_k = torch.zeros((1, 8192, self.n_local_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((1, 8192, self.n_local_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((1, 11_000, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((1, 11_000, self.n_local_kv_heads, self.head_dim))
+        # self.cache_k = torch.zeros((1, 1_000_000, self.n_local_kv_heads, self.head_dim), dtype=torch.bfloat16)
+        # self.cache_v = torch.zeros((1, 1_000_000, self.n_local_kv_heads, self.head_dim), dtype=torch.bfloat16)
+        
 
     def forward(
         self,
