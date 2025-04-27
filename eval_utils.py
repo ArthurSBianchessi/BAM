@@ -15,66 +15,69 @@ from inference_models.bam_uninterpretable import BATransformer0, BATModelArgs0
 from inference_models.bam import BATransformer, BATModelArgs 
 from inference_models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
 from inference_models.laplace import LaplaceTransformer, LaplaceModelArgs
-from models.nope import NoPEModelArgs, NoPETransformer
+from inference_models.nope import NoPEModelArgs, NoPETransformer
 
 
 
 class PasskeyEvaluator:
-    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant', patience=float('inf')):
-        self.seq_lens = seq_lens
+    def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant', patience=float('inf'), sample_size=10, seq_batch_size=None):
         # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.generator = PromptGenerator(digits=pred_digits+preffix_digits)
+        self.seq_lens = [len(self.generator(seq_len)[0][0]) for seq_len in seq_lens]
         self.device = device
         self.pred_digits = pred_digits
         self.preffix_digits = preffix_digits
         self.sampling = sampling
         self.patience = patience
+        self.sample_size = sample_size
+        self.seq_batch_size = seq_batch_size
 
     @torch.inference_mode()
     # def evaluate(self, model, sample_size=100, verbose=True, patience=3):
-    def evaluate(self, model, sample_size=10, verbose=True, patience=None):
+    def evaluate(self, model, verbose=True, patience=None, prev_results=None):
+        result_config = str((self.sampling, self.sample_size, self.pred_digits, self.preffix_digits))
+        if prev_results is not None:
+            if result_config in prev_results:
+                if set(self.seq_lens).issubset(set(prev_results[result_config]['seq_lens'])):
+                    return prev_results, prev_results[result_config]
+            results = prev_results
+            results[result_config] = {}
+        else:
+            results = {}
+            results[result_config] = {}
+        results[result_config]['seq_lens'] = []
+        results[result_config]['accs'] = []
+
         model.to(self.device)
-        accs = []
-        seq_lens = []
         patience = patience or self.patience
-        print(8)
         for seq_len in self.seq_lens:
             print(f"                0/0 correct", end='\r')
             correct = 0
-            seq_lens.append(len(self.generator(seq_len)[0][0]))
-            prompts, passkeys = self.generator(seq_len, sample_size, self.sampling)
+            prompts, passkeys = self.generator(seq_len, self.sample_size, self.sampling)
             start = time()
             for i, (prompt, pass_key) in enumerate(zip(prompts, passkeys)):
-            # for prompt, pass_key in zip(prompts, passkeys):
-                if not len(prompt) == seq_lens[-1]:
-                    raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_lens[-1]}")
+                if not len(prompt) == seq_len:
+                    raise ValueError(f"Prompt length {len(prompt)} does not match expected length {seq_len}")
                 model_input = torch.tensor(prompt+pass_key).unsqueeze(0).to(self.device)
-                # output = model(model_input)
-                output = model(model_input, seq_batch_size=8)
-                # output = model(model_input, seq_batch_size=32)
-                # pred_pass_key = output.max(-1).indices[0][-self.pred_digits-1:-1].cpu()
+                output = model(model_input, seq_batch_size=self.seq_batch_size)
                 pred_pass_key = output[0, -self.pred_digits-1:-1].cpu()
-                # print(self.generator.tokenizer.decode(pass_key))
-                # print(self.generator.tokenizer.decode(pred_pass_key))
-                # print()
                 if (list(pred_pass_key) == pass_key[self.preffix_digits+1:]):
                     correct += 1
                 end = time()
-                # print(f"seq_len: {len(prompt)}, acc: {correct}/{i+1} of {sample_size}", end='\r')
-                print(f"                seq_len: {len(prompt)}, acc: {correct}/{i+1} of {sample_size} took {(end-start)/(i+1):.2f}s", end='\r')
-            accs.append(correct/sample_size)
+                print(f"                seq_len: {len(prompt)}, acc: {correct}/{i+1} of {self.sample_size} took {(end-start)/(i+1):.2f}s", end='\r')
+            results[result_config]['seq_lens'].append(seq_len)
+            results[result_config]['accs'].append(correct/self.sample_size)
             if verbose:
-                print(f"seq_len: {len(prompt)}, acc: {correct/sample_size*100:04.1f}%                                                                                        ")
-                # print(f"seq_len: {len(prompt)}, acc: {correct}/{sample_size}")
+                print(f"seq_len: {len(prompt)}, acc: {correct/self.sample_size*100:04.1f}%                                                                                        ")
             if correct == 0:
                 patience -= 1
             else:
                 patience = self.patience
             if patience == 0:
-                print(f"Early stopping at seq_len: {seq_lens[-1]}")
+                print(f"Early stopping at seq_len: {seq_len}")
                 break
         model.to('cpu')
-        return seq_lens, accs
+        return results, results[result_config]
         
 
 
@@ -160,25 +163,24 @@ class PromptGenerator:
 
 
 class PerplexityEvaluator:
-    def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, window_pos='middle'):
+    def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, device='cpu'):
         self.dataset_dir    = os.path.join('data', dataset_dir)
         self.seq_len        = seq_len
         self.ntokens        = ntokens
         self.window_size    = window_size
-        self.window_pos     = window_pos
         self.nwindows       = int(seq_len // window_size)
-        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction='none')
+        self.cross_entropy  = torch.nn.CrossEntropyLoss(reduction='none')
+        self.device         = device
 
         assert seq_len % window_size == 0, f"seq_len {seq_len} must be divisible by window_size {window_size}"
 
-        self.tokens         = self.get_val_set()
         # glob files that match the pattern
-        file = sorted(os.listdir(self.dataset_dir))[0]
-        filename = os.path.join(self.dataset_dir, file)
-        assert len(self.files) > 0, f"did not find any files that match the pattern {self.dataset_dir}"
+        files = sorted(os.listdir(self.dataset_dir))
+        assert len(files) > 0, f"did not find any files that match the pattern {self.dataset_dir}"
+        filename = os.path.join(self.dataset_dir, files[0])
 
         dataset = torch.load(filename)
-        tokens     = dataset['input_ids'][:ntokens]
+        tokens     = dataset['input_ids'][:ntokens].long()
 
         # Identify EOS and BOS tokens 
         tokenizer      = AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3')
@@ -191,39 +193,49 @@ class PerplexityEvaluator:
         idxs = eos_idxs | bos_idxs
         tokens = tokens[~idxs]
 
-        nbatches = len(tokens) // seq_len
-        tokens = tokens[:nbatches * seq_len]
-        self.tokens = tokens.reshape(nbatches, seq_len)
+        nbatches = len(tokens) // (seq_len+1)
+        tokens = tokens[:nbatches * (seq_len + 1)]
+        self.tokens = tokens.reshape(nbatches, seq_len+1)
 
     def evaluate(self, model, prev_results=None):
+        model.to(self.device)
         if prev_results is not None:
-            perplexity = prev_results['perplexity']
-            positions = prev_results['positions']
-            return positions, perplexity
+            for result in prev_results:
+                if result['window_size'] == self.window_size and result['seq_len'] == self.seq_len and result['ntokens'] == self.ntokens and result['dataset_dir'] == self.dataset_dir:
+                    return prev_results, result
+            results = prev_results
+            results.append({})
+        else:
+            results = [{}]
+            
+
         entropies = torch.zeros(self.nwindows)
         for i, tokens in enumerate(self.tokens):
-            output = model(tokens.unsqueeze(0))
-            entropies += self.cross_entropy(output[:, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu()
-        entropies /= len(self.tokens)
+            tokens = tokens.to(self.device)
+            output = model(tokens.unsqueeze(0), return_logits=True)
+            # print(       self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu())
+            entropies += self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu()
+            print(f'{i+1}/{len(self.tokens)}', end='\r')
+        entropies = entropies/len(self.tokens)
         perplexity = torch.exp(entropies)
 
-        positions = torch.arange(self.nwindows) * self.window_size
-        if self.window_pos == 'start':
-            pass
-        elif self.window_pos == 'middle':
-            positions += self.window_size // 2
-        elif self.window_pos == 'end':
-            positions += self.window_size - 1
-        else:
-            raise ValueError(f"Unknown window position: {self.window_pos}")
-        return positions.tolist(), perplexity.tolist()
+        positions = torch.arange(self.nwindows) * self.window_size + self.window_size
+        
+        results[-1]['window_size'] = self.window_size
+        results[-1]['seq_len'] = self.seq_len
+        results[-1]['ntokens'] = self.ntokens
+        results[-1]['dataset_dir'] = self.dataset_dir
+        results[-1]['perplexity'] = perplexity.tolist()
+        results[-1]['positions'] = positions.tolist()
+        model.to('cpu')
+        return results, results[-1]
     
 class Evaluator:
     # def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, window_pos='middle'):
     # def __init__(self, seq_lens, device='cpu', pred_digits=5, preffix_digits=0, sampling='equidistant', patience=float('inf')):
     def __init__(self,
                  passkey_seq_lens=None,
-                 passkey_sample_size=10,
+                 passkey_sample_size=100,
                  passkey_pred_digits=5,
                  passkey_preffix_digits=0,
                  passkey_samplings=['equidistant', 'beginning'],
@@ -231,29 +243,29 @@ class Evaluator:
                  perplexity_dataset_dir='10B',
                  perplexity_seq_len=10_240,
                  perplexity_ntokens=3_932_160,
-                 window_size=512,
-                 window_pos='middle',
+                 perplexity_window_size=512,
                  device='cpu',
                  ):
-        self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000, 
-                                                     20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000, 
-                                                     200_000, 300_000, 400_000, 500_000]
+        self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000] 
+        # self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000, 
+        #                                              20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000, 
+        #                                              200_000, 300_000, 400_000, 500_000]
         self.passkey_evaluator = PasskeyEvaluator(
             seq_lens=self.passkey_seq_lens,
             device=device,
             pred_digits=passkey_pred_digits,
             preffix_digits=passkey_preffix_digits,
             sampling=passkey_samplings[0],
-            patience=passkey_patience
+            patience=passkey_patience,
+            sample_size=passkey_sample_size,
         )
         self.perplexity_evaluator = PerplexityEvaluator(
             dataset_dir=perplexity_dataset_dir,
             seq_len=perplexity_seq_len,
             ntokens=perplexity_ntokens,
-            window_size=window_size,
-            window_pos=window_pos
+            window_size=perplexity_window_size,
+            device=device,
         )
-        self.device = device
 
     def evaluate(self, model_dir, evals=['passkey', 'perplexity']):
         model = self.load_model(model_dir)
@@ -262,10 +274,22 @@ class Evaluator:
 
 
         if 'passkey' in evals:
-            passkey_lens, passkey_accs = self.passkey_evaluator.evaluate(model, sample_size=self.passkey_sample_size, prev_results=results['passkey'])
+            results['passkey'], passkey_result = self.passkey_evaluator.evaluate(model, prev_results=results['passkey'])
+        else:
+            passkey_result = None
 
         if 'perplexity' in evals:
-            perplexity_lens, perplexity_accs = self.perplexity_evaluator.evaluate(model, prev_results=results['perplexity'])
+            results['perplexity'], perplexity_result = self.perplexity_evaluator.evaluate(model, prev_results=results['perplexity'])
+        else:
+            perplexity_result = None
+
+        # Save the results
+        with open(os.path.join(model_dir, 'results.json'), 'w') as f:
+            json.dump(results, f, indent=4)
+        return {
+            'passkey': passkey_result,
+            'perplexity': perplexity_result,
+        }
         
 
 
@@ -297,5 +321,8 @@ class Evaluator:
             with open(os.path.join(dir, 'results.json')) as f:
                 results = json.load(f)
         else:
-            results = {}
+            results = {
+                'passkey': None,
+                'perplexity': None,
+            }
         return results
