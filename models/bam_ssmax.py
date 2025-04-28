@@ -35,6 +35,7 @@ class SSMaxBATModelArgs:
 
     global_positional_encoding: bool = True
     seq_scale: bool = True
+    ssmax_prior: bool = True
 
 # loc = exp(loc) - exp(-loc)
 
@@ -141,6 +142,7 @@ class BayesianAttention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.ssmax_prior = args.ssmax_prior
 
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -174,12 +176,14 @@ class BayesianAttention(nn.Module):
         # print(scores.shape)
         # print(section_log_len.shape)
         # print(self.seq_scale.shape)
-        if section_log_len is not None:
+        if section_log_len is not None and not self.ssmax_prior:
             scores = scores * section_log_len * self.seq_scale
         if self.local_positional_encoding:
             scores = scores + self.prior(seqlen)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        if section_log_len is not None and self.ssmax_prior:
+            scores = scores * section_log_len * self.seq_scale
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
