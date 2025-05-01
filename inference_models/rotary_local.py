@@ -94,11 +94,15 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        start_pos: Optional[int] = 0,
     ):
         bsz, seqlen, _ = x.shape
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
@@ -108,6 +112,21 @@ class Attention(nn.Module):
         values = values.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
         queries, keys = apply_rotary_emb(queries, keys, freqs_cis=freqs_cis)
+
+        self.cache_k = self.cache_k.to(x.device)
+        self.cache_v = self.cache_v.to(x.device)
+        if self.cache_k.size(1) < seqlen+start_pos:
+            new_size = max(seqlen+start_pos, self.cache_k.size(1)*2)
+            temp_cache_k = torch.zeros((1, new_size, self.n_local_kv_heads, self.head_dim), device=x.device)
+            temp_cache_v = torch.zeros((1, new_size, self.n_local_kv_heads, self.head_dim), device=x.device)
+            temp_cache_k[:, :self.cache_k.size(1), :, :] = self.cache_k
+            temp_cache_v[:, :self.cache_v.size(1), :, :] = self.cache_v
+            self.cache_k = temp_cache_k
+            self.cache_v = temp_cache_v
+        self.cache_k[:, start_pos:start_pos+seqlen, :, :] = keys
+        self.cache_v[:, start_pos:start_pos+seqlen, :, :] = values
+        keys = self.cache_k[:, :start_pos+seqlen, :, :]
+        values = self.cache_v[:, :start_pos+seqlen, :, :]
 
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -167,8 +186,9 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        start_pos: Optional[int] = 0,
     ):
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, start_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -196,37 +216,51 @@ class LocalRotaryTransformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        if seqlen < 2*self.params.max_seq_len:
-            self.freqs_cis = self.freqs_cis.to(h.device)
-            freqs_cis = self.freqs_cis[:seqlen]
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False, return_device=None):
+        return_device = return_device if return_device is not None else tokens.device
+        _bsz, full_seqlen = tokens.shape
+        full_h = self.tok_embeddings(tokens)
+        full_output = []
+
+        if full_seqlen < 2*self.params.max_seq_len:
+            self.freqs_cis = self.freqs_cis.to(full_h.device)
+            full_freqs_cis = self.freqs_cis[:full_seqlen]
         else:
-            freqs_cis = precompute_freqs_cis(
+            full_freqs_cis = precompute_freqs_cis(
                 self.params.dim // self.params.n_heads,
-                seqlen,
+                full_seqlen,
                 self.params.rope_theta,
             )
-            freqs_cis = freqs_cis.to(h.device)
+            full_freqs_cis = full_freqs_cis.to(full_h.device)
 
-        mask = None
-        if seqlen > 1:
+        if seq_batch_size is None:
+            seq_batch_size = full_seqlen
+        for start_pos in range(0, full_seqlen, seq_batch_size):
+            h = full_h[:, start_pos:start_pos+seq_batch_size, :]
+            freqs_cis = full_freqs_cis[start_pos:start_pos+seq_batch_size]
+            
+            # h = full_h[:, start_pos:start_pos+seq_batch_size, :]
+            _bsz, seqlen, h_dim = h.shape
+            mask = None
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
+            if start_pos > 0:
+                mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask])
 
-            positions = torch.arange(seqlen, device=tokens.device).float()
-            local_mask = (positions[None, :] - positions[:, None]).abs() > self.params.max_seq_len
+            q_positions = torch.arange(seqlen, device=tokens.device).float() + start_pos
+            k_positions = torch.arange(seqlen+start_pos, device=tokens.device).float()
+            local_mask = (k_positions[None,:] - q_positions[:, None]).abs() > self.params.max_seq_len
             mask[local_mask] = float("-inf")
-                
+
             mask = mask.type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
-        
-        if return_logits:
-            return output
-        else:
-            return output.argmax(-1)
+            for layer in self.layers:
+                h = layer(h, freqs_cis, mask, start_pos)
+            h = self.norm(h)
+            output = self.output(h).float()
+            if return_logits:
+                full_output.append(output.to(return_device))
+            else:
+                full_output.append(output.argmax(-1).to(return_device))
+        output = torch.cat(full_output, dim=1)
+        return output

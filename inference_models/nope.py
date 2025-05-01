@@ -64,10 +64,14 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        start_pos: Optional[int] = 0,
     ):
         bsz, seqlen, _ = x.shape
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
@@ -75,6 +79,21 @@ class Attention(nn.Module):
         queries = queries.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         keys = keys.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         values = values.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        self.cache_k = self.cache_k.to(x.device)
+        self.cache_v = self.cache_v.to(x.device)
+        if self.cache_k.size(1) < seqlen+start_pos:
+            new_size = max(seqlen+start_pos, self.cache_k.size(1)*2)
+            temp_cache_k = torch.zeros((1, new_size, self.n_local_kv_heads, self.head_dim), device=x.device)
+            temp_cache_v = torch.zeros((1, new_size, self.n_local_kv_heads, self.head_dim), device=x.device)
+            temp_cache_k[:, :self.cache_k.size(1), :, :] = self.cache_k
+            temp_cache_v[:, :self.cache_v.size(1), :, :] = self.cache_v
+            self.cache_k = temp_cache_k
+            self.cache_v = temp_cache_v
+        self.cache_k[:, start_pos:start_pos+seqlen, :, :] = keys
+        self.cache_v[:, start_pos:start_pos+seqlen, :, :] = values
+        keys = self.cache_k[:, :start_pos+seqlen, :, :]
+        values = self.cache_v[:, :start_pos+seqlen, :, :]
 
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
@@ -131,8 +150,9 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        start_pos: Optional[int] = 0,
     ):
-        h = x + self.attention(self.attention_norm(x), mask)
+        h = x + self.attention(self.attention_norm(x), mask, start_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -154,21 +174,33 @@ class NoPETransformer(nn.Module):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False, return_device=None):
+        return_device = return_device if return_device is not None else tokens.device
 
-        mask = None
-        if seqlen > 1:
+        _bsz, seqlen = tokens.shape
+        full_h = self.tok_embeddings(tokens)
+        full_output = []
+
+        if seq_batch_size is None:
+            seq_batch_size = seqlen
+
+        for start_pos in range(0, seqlen, seq_batch_size):
+            h = full_h[:, start_pos:start_pos+seq_batch_size, :].contiguous()
+            _bsz, seqlen, h_dim = h.shape
+
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
+            if start_pos > 0:
+                mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask])
             mask = mask.type_as(h)
 
-        for layer in self.layers:
-            h = layer(h, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
-        if return_logits:
-            return output
-        else:
-            return output.argmax(-1)
+            for layer in self.layers:
+                h = layer(h, mask, start_pos)
+            h = self.norm(h)
+            output = self.output(h).float()
+            if return_logits:
+                full_output.append(output.to(return_device))
+            else:
+                full_output.append(output.argmax(-1).to(return_device))
+        full_output = torch.cat(full_output, dim=1)
+        return full_output

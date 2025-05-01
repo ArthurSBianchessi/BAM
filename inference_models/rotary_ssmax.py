@@ -56,7 +56,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
-def apply_rotarySSMax_emb(
+def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -117,8 +117,7 @@ class Attention(nn.Module):
         keys = keys.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         values = values.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        queries, keys = apply_rotarySSMax_emb(queries, keys, freqs_cis=freqs_cis)
-
+        queries, keys = apply_rotary_emb(queries, keys, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(x.device)
         self.cache_v = self.cache_v.to(x.device)
@@ -224,7 +223,8 @@ class RotarySSMaxTransformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False, return_device=None):
+        return_device = return_device if return_device is not None else tokens.device
         _bsz, full_seqlen = tokens.shape
         full_h = self.tok_embeddings(tokens)
         full_output = []
@@ -263,8 +263,8 @@ class RotarySSMaxTransformer(nn.Module):
             h = self.norm(h)
             output = self.output(h).float()
             if return_logits:
-                full_output.append(output)
+                full_output.append(output.to(return_device))
             else:
-                full_output.append(output.argmax(-1))
+                full_output.append(output.argmax(-1).to(return_device))
         output = torch.cat(full_output, dim=1)
         return output
