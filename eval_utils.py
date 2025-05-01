@@ -4,6 +4,7 @@ import random
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
+from datasets import load_dataset
 from time import time
 
 from inference_models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
@@ -163,39 +164,66 @@ class PromptGenerator:
 
 
 class PerplexityEvaluator:
-    def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, device='cpu'):
+    def __init__(self, dataset_dir, seq_len, ntokens, window_size=512, device='cpu', wiki_articles=512, seq_batch_size=None):
         self.dataset_dir    = os.path.join('data', dataset_dir)
         self.seq_len        = seq_len
         self.ntokens        = ntokens
         self.window_size    = window_size
         self.nwindows       = int(seq_len // window_size)
         self.cross_entropy  = torch.nn.CrossEntropyLoss(reduction='none')
+        self.seq_batch_size = seq_batch_size
         self.device         = device
 
         assert seq_len % window_size == 0, f"seq_len {seq_len} must be divisible by window_size {window_size}"
 
-        # glob files that match the pattern
-        files = sorted(os.listdir(self.dataset_dir))
-        assert len(files) > 0, f"did not find any files that match the pattern {self.dataset_dir}"
-        filename = os.path.join(self.dataset_dir, files[0])
+        if dataset_dir == 'wikipedia':
+            tokenizer = AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3')
+            # load the dataset from the wikitext-2 dataset
+            dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train")
+            tokens = []
+            for i in range(0, len(dataset), 4096):
+                input_ids = tokenizer(dataset[i:i+4096]['text'], add_special_tokens=True)['input_ids']
+                for input_id in input_ids:
+                    if len(input_id) >= seq_len+1:
+                        tokens.append(input_id[:seq_len+1])
+                        print(f"Loaded {len(tokens)} articles", end='\r')
+                    if len(tokens) >= wiki_articles:
+                        break
+                if len(tokens) >= wiki_articles:
+                    break
+            self.tokens = torch.tensor(tokens).long()
 
-        dataset = torch.load(filename)
-        tokens     = dataset['input_ids'][:ntokens].long()
+                
+        else:
+            # glob files that match the pattern
+            files = sorted(os.listdir(self.dataset_dir))
+            assert len(files) > 0, f"did not find any files that match the pattern {self.dataset_dir}"
+            filename = os.path.join(self.dataset_dir, files[0])
 
-        # Identify EOS and BOS tokens 
-        tokenizer      = AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3')
-        eos_token_id   = tokenizer.eos_token_id
-        bos_token_id   = tokenizer.bos_token_id
+            dataset = torch.load(filename)
+            # tokens     = dataset['input_ids'].long()
+            tokens     = dataset['input_ids'][:ntokens+1].long()
 
-        # Remove EOS and BOS tokens from the dataset
-        eos_idxs = tokens == eos_token_id
-        bos_idxs = tokens == bos_token_id
-        idxs = eos_idxs | bos_idxs
-        tokens = tokens[~idxs]
+            # Identify EOS and BOS tokens 
+            tokenizer      = AutoTokenizer.from_pretrained('mistralai/Mistral-7B-Instruct-v0.3')
+            eos_token_id   = tokenizer.eos_token_id
+            bos_token_id   = tokenizer.bos_token_id
 
-        nbatches = len(tokens) // (seq_len+1)
-        tokens = tokens[:nbatches * (seq_len + 1)]
-        self.tokens = tokens.reshape(nbatches, seq_len+1)
+            # Remove EOS and BOS tokens from the dataset
+            eos_idxs = tokens == eos_token_id
+            bos_idxs = tokens == bos_token_id
+            idxs = eos_idxs | bos_idxs
+            tokens = tokens[~idxs]
+
+            nbatches = len(tokens) // (seq_len+1)
+            tokens = tokens[:nbatches * (seq_len + 1)]
+            self.tokens = tokens.reshape(nbatches, seq_len+1)
+
+            # nbatches = len(tokens) // (seq_len)
+            # targets = tokens[1:nbatches * (seq_len)+1]
+            # tokens = tokens[:nbatches * (seq_len)]
+            # self.tokens = tokens.reshape(-1, seq_len)
+            # self.targets = targets.reshape(-1, seq_len)
 
     def evaluate(self, model, prev_results=None):
         model.to(self.device)
@@ -210,13 +238,21 @@ class PerplexityEvaluator:
             
 
         entropies = torch.zeros(self.nwindows)
+        entropies_sqrd = torch.zeros(self.nwindows)
         for i, tokens in enumerate(self.tokens):
-            tokens = tokens.to(self.device)
-            output = model(tokens.unsqueeze(0), return_logits=True)
+            # tokens = tokens.to(self.device)
+            print(f'{i+1}/{len(self.tokens)}   {entropies.sum()}', end='\r')
+            # output = model(tokens.unsqueeze(0).to(self.device)).cpu()
+            # loss = self.cross_entropy(output[0, :, :], self.targets[i]).reshape(-1, self.window_size)
+            output = model(tokens.unsqueeze(0).to(self.device), seq_batch_size=self.seq_batch_size, return_logits=True)
+            loss = self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size)
             # print(       self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu())
-            entropies += self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu()
-            print(f'{i+1}/{len(self.tokens)}', end='\r')
+
+            entropies += loss.mean(dim=-1).cpu().detach()
+            entropies_sqrd += (loss**2).mean(dim=-1).cpu().detach()
         entropies = entropies/len(self.tokens)
+        entropies_sqrd = entropies_sqrd/len(self.tokens)
+        entropies_std = torch.sqrt(entropies_sqrd - entropies**2)
         perplexity = torch.exp(entropies)
 
         positions = torch.arange(self.nwindows) * self.window_size + self.window_size
@@ -240,33 +276,55 @@ class Evaluator:
                  passkey_preffix_digits=0,
                  passkey_samplings=['equidistant', 'beginning'],
                  passkey_patience=float('inf'),
-                 perplexity_dataset_dir='10B',
+                #  perplexity_dataset_dir='wikipedia',
+                #  perplexity_dataset_dir='10B',
+                 perplexity_dataset_dirs=['10B', 'wikipedia'],
                  perplexity_seq_len=10_240,
                  perplexity_ntokens=3_932_160,
                  perplexity_window_size=512,
+                #  perplexity_wiki_articles=64,
+                 perplexity_wiki_articles=512,
+                 seq_batch_size=None,
                  device='cpu',
                  ):
         self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000] 
         # self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000, 
         #                                              20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000, 
         #                                              200_000, 300_000, 400_000, 500_000]
-        self.passkey_evaluator = PasskeyEvaluator(
-            seq_lens=self.passkey_seq_lens,
-            device=device,
-            pred_digits=passkey_pred_digits,
-            preffix_digits=passkey_preffix_digits,
-            sampling=passkey_samplings[0],
-            patience=passkey_patience,
-            sample_size=passkey_sample_size,
-        )
-        self.perplexity_evaluator = PerplexityEvaluator(
-            dataset_dir=perplexity_dataset_dir,
-            seq_len=perplexity_seq_len,
-            ntokens=perplexity_ntokens,
-            window_size=perplexity_window_size,
-            device=device,
-        )
+        # self.passkey_evaluator = PasskeyEvaluator(
+        #     seq_lens=self.passkey_seq_lens,
+        #     device=device,
+        #     pred_digits=passkey_pred_digits,
+        #     preffix_digits=passkey_preffix_digits,
+        #     sampling=passkey_samplings[0],
+        #     patience=passkey_patience,
+        #     sample_size=passkey_sample_size,
+        # )
+        self.passkey_evaluators = []
+        for sampling in passkey_samplings:
+            self.passkey_evaluators.append(PasskeyEvaluator(
+                seq_lens=self.passkey_seq_lens,
+                pred_digits=passkey_pred_digits,
+                preffix_digits=passkey_preffix_digits,
+                sampling=sampling,
+                patience=passkey_patience,
+                sample_size=passkey_sample_size,
+                seq_batch_size=seq_batch_size,
+                device=device,
+            ))
 
+        self.perplexity_evaluators = []
+        for perplexity_dataset_dir in perplexity_dataset_dirs:
+            self.perplexity_evaluators.append(PerplexityEvaluator(
+                dataset_dir=perplexity_dataset_dir,
+                seq_len=perplexity_seq_len,
+                ntokens=perplexity_ntokens,
+                window_size=perplexity_window_size,
+                wiki_articles=perplexity_wiki_articles,
+                seq_batch_size=seq_batch_size,
+                device=device,
+            ))
+            
     def evaluate(self, model_dir, evals=['passkey', 'perplexity']):
         model = self.load_model(model_dir)
         results = self.load_results(model_dir)
@@ -274,12 +332,22 @@ class Evaluator:
 
 
         if 'passkey' in evals:
-            results['passkey'], passkey_result = self.passkey_evaluator.evaluate(model, prev_results=results['passkey'])
+            # results['passkey'], passkey_result = self.passkey_evaluator.evaluate(model, prev_results=results['passkey'])
+            passkey_results = {}
+            for evaluator in self.passkey_evaluators:
+                results['passkey'], passkey_result = evaluator.evaluate(model, prev_results=results['passkey'])
+                # passkey_results.append(passkey_result)
+                passkey_results[evaluator.sampling] = passkey_result
         else:
             passkey_result = None
 
         if 'perplexity' in evals:
-            results['perplexity'], perplexity_result = self.perplexity_evaluator.evaluate(model, prev_results=results['perplexity'])
+            # results['perplexity'], perplexity_result = self.perplexity_evaluator.evaluate(model, prev_results=results['perplexity'])
+            perplexity_results = {}
+            for evaluator in self.perplexity_evaluators:
+                results['perplexity'], perplexity_result = evaluator.evaluate(model, prev_results=results['perplexity'])
+                # perplexity_results.append(perplexity_result)
+                perplexity_results[evaluator.dataset_dir] = perplexity_result
         else:
             perplexity_result = None
 
@@ -287,8 +355,8 @@ class Evaluator:
         with open(os.path.join(model_dir, 'results.json'), 'w') as f:
             json.dump(results, f, indent=4)
         return {
-            'passkey': passkey_result,
-            'perplexity': perplexity_result,
+            'passkey': passkey_results,
+            'perplexity': perplexity_results,
         }
         
 

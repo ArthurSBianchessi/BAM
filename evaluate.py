@@ -58,20 +58,63 @@
 
 
 from eval_utils import Evaluator
-DEVICE = 'cuda:0'
+DEVICE = 'cuda:1'
 
-evaluator = Evaluator(device=DEVICE)
+evaluator = Evaluator(device=DEVICE,
+                      seq_batch_size=1024,
+                      passkey_preffix_digits=1,
+                    #   # passkey_seq_lens=[0, 1000, 10_000, 100_000, 500_000],
+                    #   # passkey_seq_lens=[0, 1000, 10_000, 100_000, 500_000],
+                    #   # passkey_sample_size=1,
+                    #   # passkey_samplings=['beginning'],
+                    #   passkey_samplings=[],
+                    # #   passkey_samplings=['equidistant'],
+                    # #   perplexity_wiki_articles=2,
+                    # #   perplexity_wiki_articles=32,
+                    #   perplexity_seq_len=1024,
+                    # #   perplexity_seq_len=20480,
+                    # #   perplexity_seq_len=2*20480,
+                    # #   perplexity_seq_len=4*20480,
+                    #   seq_batch_size=1024,
+                    #   # perplexity_seq_len=102400,
+                    #   perplexity_dataset_dirs=['10B']
+                    #   # perplexity_dataset_dirs=['10B']
+                    #   # perplexity_dataset_dirs=[]
+)
 
 nope_1024           = 'logs_paper/1024/nope/version_00/'
 sin_1024            = 'logs_paper/1024/sinusoidal/version_00/'
 rotary_1024         = 'logs_paper/1024/rotary/version_00/'
+rotary_local_1024   = 'logs_paper/1024/rotary_local/version_00/'
 alibi_1024          = 'logs_paper/1024/alibi/version_00/'
 bam_1024            = 'logs_paper/1024/bam/version_00/'
 rotary_ssmax_1024   = 'logs_paper/1024/rotary_ssmax/version_00/'
-bam_ssmax_1024      = 'logs_paper/1024/bam_ssmax/version_00/'
+bam_ssmax_1024      = 'logs_paper/1024/bam_ssmax/version_01/'
+bam_ssmax_1024      = 'logs_paper/1024/bam_ssmax/version_01/'
+bam_ssmax_1024      = 'logs/l12/bam_ssmax/version_08/'
+bam_ssmax_1024      = 'logs_paper/1024/bam_ssmax/version_02/'
+bam_ssmax_1024      = 'logs_paper/1024/bam_ssmax/version_02_2/'
 
-for model_path in [nope_1024, sin_1024, rotary_1024, alibi_1024, bam_1024, bam_ssmax_1024]:
+# for model_path in [nope_1024, sin_1024, rotary_1024, rotary_local_1024, alibi_1024, bam_1024, bam_ssmax_1024]:
+# for model_path in [alibi_1024, bam_1024, bam_ssmax_1024]:
+for model_path in [bam_ssmax_1024]:
+# for model_path in [rotary_local_1024]:
     print(f"Evaluating {model_path}")
     evaluator.evaluate(model_path)
     print('\n')
 
+
+evaluator = Evaluator(device=DEVICE,
+                      passkey_preffix_digits=1,
+                      passkey_seq_lens=[0, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000, 200_000, 300_000, 400_000, 500_000],
+                      passkey_sample_size=10,
+                      seq_batch_size=64,
+                      perplexity_seq_len=102400,
+                      perplexity_wiki_articles=40,
+)
+
+for model_path in [bam_ssmax_1024]:
+# for model_path in [rotary_local_1024]:
+    print(f"Evaluating {model_path}")
+    evaluator.evaluate(model_path)
+    print('\n')
