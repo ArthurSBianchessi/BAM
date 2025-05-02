@@ -1,6 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
-
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -23,8 +20,6 @@ class SSMaxBATModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
-    # shape_init: float | str = 'linear'
-    # scale_init: float | str = 1/16
     shape_init: float | str = 1
     scale_init: float | str = 'slope'
     loc_init:   float = 0
@@ -36,8 +31,6 @@ class SSMaxBATModelArgs:
     global_positional_encoding: bool = True
     seq_scale: bool = True
     ssmax_prior: bool = True
-
-# loc = exp(loc) - exp(-loc)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -79,31 +72,10 @@ class AttentionPrior(nn.Module):
         self.scale = nn.Parameter(scale, requires_grad = args.train_scale)
         self.loc   = nn.Parameter(loc,   requires_grad = args.train_loc)
 
-
-        # positions = torch.arange(self.seq_len).float()
-        # self.register_buffer("dist_matrix", 
-        #                      (positions[None, :] - positions[:, None]).reshape(1, 1, self.seq_len, self.seq_len), 
-        #                      persistent=False)
-        # self.dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, self.seq_len, self.seq_len)
-
-
     def forward(self, seq_len=None):
-        # if seq_len == self.dist_matrix.shape[-1] or seq_len is None:
-        #     dist_matrix = self.dist_matrix.to(self.scale.device)
-        # elif seq_len < self.dist_matrix.shape[-1]:
-        #     print('FUUUUCK')
-        #     dist_matrix = self.dist_matrix[..., :seq_len, :seq_len].to(self.scale.device)
-        # else:
-        #     print('FUUUUCK2')
-        #     positions = torch.arange(seq_len).float().to(self.scale.device)
-        #     dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
-
-        # positions = torch.arange(seq_len).float().to(self.scale.device)
         seq_len = seq_len or self.seq_len
         positions = torch.arange(seq_len, device=self.scale.device).float()
         dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
-        # return -(dist_matrix.abs() * self.scale).abs()
-        # return -(dist_matrix * self.scale + self.loc).abs()
         loc = self.loc.exp() - (-self.loc).exp()
         z = (dist_matrix - loc) * self.scale.exp()
         return -((z.abs()+self.eps)**self.shape )
@@ -160,6 +132,7 @@ class BayesianAttention(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        gloabal_prior: Optional[torch.Tensor] = None,
         section_log_len: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
@@ -173,17 +146,21 @@ class BayesianAttention(nn.Module):
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # print(scores.shape)
-        # print(section_log_len.shape)
-        # print(self.seq_scale.shape)
-        if section_log_len is not None and not self.ssmax_prior:
-            scores = scores * section_log_len * self.seq_scale
+
+        if not self.ssmax_prior:
+            scores = scores * (section_log_len * self.seq_scale)
+
         if self.local_positional_encoding:
             scores = scores + self.prior(seqlen)
+        else:
+            scores = scores + gloabal_prior
+
+        if self.ssmax_prior:
+            scores = scores * (section_log_len * self.seq_scale)
+
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        if section_log_len is not None and self.ssmax_prior:
-            scores = scores * section_log_len * self.seq_scale
+
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -233,18 +210,12 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        gloabal_prior: Optional[torch.Tensor] = None,
         section_log_len: Optional[torch.Tensor] = None,
     ):
-        h = x + self.attention(self.attention_norm(x), mask, section_log_len)
+        h = x + self.attention(self.attention_norm(x), mask, gloabal_prior, section_log_len)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
-
-import os
-def print0(*args, **kwargs):
-    # modified print that only prints from the master process
-    # if this is not a distributed run, it's just a print
-    if int(os.environ.get("RANK", 0)) == 0:
-        print(*args, **kwargs)
 
 class SSMaxBATransformer(nn.Module):
     def __init__(self, params: SSMaxBATModelArgs):
@@ -265,8 +236,6 @@ class SSMaxBATransformer(nn.Module):
 
         if self.params.global_positional_encoding:
             self.prior = AttentionPrior(params)
-        # self.slopes = torch.tensor(get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1)
-        # self.register_buffer("slopes", torch.tensor(get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1))
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
@@ -289,20 +258,14 @@ class SSMaxBATransformer(nn.Module):
                 section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
 
 
+            global_prior = None
             if self.global_positional_encoding:
-                # print0()
-                # print0(self.prior(seqlen).mean())
-                # print0(self.prior(seqlen)[0,0,0])
-                # print0()
-                mask = mask + self.prior(seqlen)
-            # positions = torch.arange(seqlen, device=tokens.device).float()
-            # position_encodings = -(positions[None, :] - positions[:, None]).abs() * self.slopes
-            # mask = mask + position_encodings
+                global_prior = self.prior(seqlen)
 
             mask = mask.type_as(h)
 
         for layer in self.layers:
-            h = layer(h, mask, section_log_len)
+            h = layer(h, mask, global_prior, section_log_len)
         h = self.norm(h)
         output = self.output(h).float()
         return output

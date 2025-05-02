@@ -1,6 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
-
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -23,10 +20,8 @@ class SSMaxBATModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
-    # shape_init: float | str = 'linear'
-    # scale_init: float | str = 1/16
-    shape_init: float | str = 1
-    scale_init: float | str = 'slope'
+    shape_init: float | str = 0
+    scale_init: float | str = 5
     loc_init:   float = 0
 
     train_shape: bool = True
@@ -35,8 +30,7 @@ class SSMaxBATModelArgs:
 
     global_positional_encoding: bool = True
     seq_scale: bool = True
-
-# loc = exp(loc) - exp(-loc)
+    ssmax_prior: bool = True
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -82,17 +76,6 @@ class AttentionPrior(nn.Module):
 
 
     def forward(self, seq_len=None, start_pos=0):
-        # if seq_len == self.dist_matrix.shape[-1] or seq_len is None:
-        #     dist_matrix = self.dist_matrix.to(self.scale.device)
-        # elif seq_len < self.dist_matrix.shape[-1]:
-        #     print('FUUUUCK')
-        #     dist_matrix = self.dist_matrix[..., :seq_len, :seq_len].to(self.scale.device)
-        # else:
-        #     print('FUUUUCK2')
-        #     positions = torch.arange(seq_len).float().to(self.scale.device)
-        #     dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
-
-        # positions = torch.arange(seq_len).float().to(self.scale.device)
         seq_len = seq_len or self.seq_len
         q_positions = torch.arange(seq_len, device=self.scale.device).float() + start_pos
         k_positions = torch.arange(seq_len+start_pos, device=self.scale.device).float()
@@ -136,6 +119,7 @@ class BayesianAttention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.ssmax_prior = args.ssmax_prior
 
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -149,16 +133,15 @@ class BayesianAttention(nn.Module):
         seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
         self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
 
-        self.cache_v = torch.zeros((1, 11_000, self.n_local_kv_heads, self.head_dim))
-        self.cache_k = torch.zeros((1, 11_000, self.n_local_kv_heads, self.head_dim))
-        # self.cache_k = torch.zeros((1, 1_000_000, self.n_local_kv_heads, self.head_dim), dtype=torch.bfloat16)
-        # self.cache_v = torch.zeros((1, 1_000_000, self.n_local_kv_heads, self.head_dim), dtype=torch.bfloat16)
+        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
         
 
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        global_prior: Optional[torch.Tensor] = None,
         section_log_len: Optional[torch.Tensor] = None,
         start_pos: int = 0,
     ):
@@ -189,10 +172,18 @@ class BayesianAttention(nn.Module):
         values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
 
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        scores = scores * section_log_len * self.seq_scale
+
+        if section_log_len is not None and not self.ssmax_prior:
+            scores = (scores * section_log_len) * self.seq_scale
 
         if self.local_positional_encoding:
-            scores = scores + self.prior(seqlen)
+            scores = scores + self.prior(seqlen, start_pos)
+        elif global_prior is not None:
+            scores = scores + global_prior
+
+        if section_log_len is not None and self.ssmax_prior:
+            scores = (scores * section_log_len) * self.seq_scale
+
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
@@ -245,19 +236,13 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        global_prior: Optional[torch.Tensor] = None,
         section_log_len: Optional[torch.Tensor] = None,
         start_pos: int = 0,
     ):
-        h = x + self.attention(self.attention_norm(x), mask, section_log_len, start_pos)
+        h = x + self.attention(self.attention_norm(x), mask, global_prior, section_log_len, start_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
-
-import os
-def print0(*args, **kwargs):
-    # modified print that only prints from the master process
-    # if this is not a distributed run, it's just a print
-    if int(os.environ.get("RANK", 0)) == 0:
-        print(*args, **kwargs)
 
 class SSMaxBATransformer(nn.Module):
     def __init__(self, params: SSMaxBATModelArgs):
@@ -278,11 +263,10 @@ class SSMaxBATransformer(nn.Module):
 
         if self.params.global_positional_encoding:
             self.prior = AttentionPrior(params)
-        # self.slopes = torch.tensor(get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1)
-        # self.register_buffer("slopes", torch.tensor(get_slopes(params.n_heads)).reshape(1, params.n_heads, 1, 1))
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False):
+    def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False, return_device=None):
+        return_device = return_device if return_device is not None else tokens.device
         _bsz, seqlen = tokens.shape
         full_h = self.tok_embeddings(tokens)
         full_output = []
@@ -291,9 +275,8 @@ class SSMaxBATransformer(nn.Module):
             seq_batch_size = seqlen
         for start_pos in range(0, seqlen, seq_batch_size):
             h = full_h[:, start_pos:start_pos+seq_batch_size, :].contiguous()
-            # h = full_h[:, start_pos:start_pos+seq_batch_size, :]
             _bsz, seqlen, h_dim = h.shape
-            mask = None
+
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
             if start_pos > 0:
@@ -301,19 +284,19 @@ class SSMaxBATransformer(nn.Module):
 
             section_log_len = mask.isfinite().float().sum(-1, keepdim=True).log().unsqueeze(-3)
 
-
+            global_prior = None
             if self.global_positional_encoding:
-                mask = mask + self.prior(seqlen, start_pos)
+                global_prior = self.prior(seqlen, start_pos)
 
             mask = mask.type_as(h)
 
             for layer in self.layers:
-                h = layer(h, mask, section_log_len, start_pos)
+                h = layer(h, mask, global_prior, section_log_len, start_pos)
             h = self.norm(h)
             output = self.output(h).float()
             if return_logits:
-                full_output.append(output)
+                full_output.append(output.to(return_device))
             else:
-                full_output.append(output.argmax(-1))
+                full_output.append(output.argmax(-1).to(return_device))
         full_output = torch.cat(full_output, dim=1)
         return full_output
