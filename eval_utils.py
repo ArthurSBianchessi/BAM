@@ -244,7 +244,7 @@ class PerplexityEvaluator:
             print(f'{i+1}/{len(self.tokens)}   {entropies.sum()}', end='\r')
             # output = model(tokens.unsqueeze(0).to(self.device)).cpu()
             # loss = self.cross_entropy(output[0, :, :], self.targets[i]).reshape(-1, self.window_size)
-            output = model(tokens.unsqueeze(0).to(self.device), seq_batch_size=self.seq_batch_size, return_logits=True)
+            output = model(tokens.unsqueeze(0).to(self.device), seq_batch_size=self.seq_batch_size, return_logits=True, return_device='cpu')
             loss = self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size)
             # print(       self.cross_entropy(output[0, :-1, :], tokens[1:]).reshape(-1, self.window_size).mean(dim=-1).cpu())
 
