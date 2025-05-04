@@ -94,6 +94,9 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -243,12 +246,6 @@ class RotaryTransformer(nn.Module):
             mask = torch.triu(mask, diagonal=1)
             if start_pos > 0:
                 mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask])
-
-            q_positions = torch.arange(seqlen, device=tokens.device).float() + start_pos
-            k_positions = torch.arange(seqlen+start_pos, device=tokens.device).float()
-            local_mask = (k_positions[None,:] - q_positions[:, None]).abs() > self.params.max_seq_len
-            mask[local_mask] = float("-inf")
-
             mask = mask.type_as(h)
 
             for layer in self.layers:

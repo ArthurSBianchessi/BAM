@@ -200,8 +200,8 @@ class ALiBiTransformer(nn.Module):
             if start_pos > 0:
                 mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask])
 
-            q_positions = torch.arange(seqlen, device=self.scale.device).float() + start_pos
-            k_positions = torch.arange(seqlen+start_pos, device=self.scale.device).float()
+            q_positions = torch.arange(seqlen, device=self.slopes.device).float() + start_pos
+            k_positions = torch.arange(seqlen+start_pos, device=self.slopes.device).float()
             position_encodings = (k_positions[None,:] - q_positions[:, None]) * self.slopes
             mask = mask + position_encodings
             mask = mask.type_as(h)
