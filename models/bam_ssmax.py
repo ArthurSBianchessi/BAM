@@ -52,15 +52,27 @@ class AttentionPrior(nn.Module):
         self.n_heads = args.n_heads
         self.eps = 1e-5
 
+        self.train_loc = args.train_loc
+        self.train_shape = args.train_shape
+        self.train_scale = args.train_scale
+
+        self.loc_init   = str(args.loc_init)
+        self.scale_init = str(args.scale_init)
+        self.shape_init = str(args.shape_init)
+
         
         if args.scale_init == 'slope':
             scale = torch.tensor(get_slopes(args.n_heads), dtype=torch.float).reshape(1, args.n_heads, 1, 1)
+        elif args.scale_init == 'sampled':
+            scale = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float).exp()
         else:
-            scale = torch.full((1, args.n_heads, 1, 1), float(args.scale_init), dtype=torch.float)
+            scale = 1/torch.full((1, args.n_heads, 1, 1), float(args.scale_init), dtype=torch.float)
         scale = torch.log(scale)
         
         if args.train_shape and args.shape_init == 'linear':
             shape  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
+        elif args.train_shape and args.shape_init == 'sampled':
+            shape  = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float)
         elif args.train_shape:
             shape   = torch.full((1, args.n_heads, 1, 1), float(args.shape_init), dtype=torch.float)
         else:
@@ -75,10 +87,23 @@ class AttentionPrior(nn.Module):
     def forward(self, seq_len=None):
         seq_len = seq_len or self.seq_len
         positions = torch.arange(seq_len, device=self.scale.device).float()
-        dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
-        loc = self.loc.exp() - (-self.loc).exp()
-        z = (dist_matrix - loc) * self.scale.exp()
-        return -((z.abs()+self.eps)**self.shape )
+        b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
+        # loc = self.loc.exp() - (-self.loc).exp()
+        # # z = (dist_matrix - loc) * self.scale.exp()
+        # # return -((z.abs()+self.eps)**self.shape )
+        # z = (dist_matrix - loc) 
+        # return -(((z.abs()+self.eps)**self.shape) * self.scale.exp())
+
+        # if self.train_loc or self.loc_init != '0':
+        #     b -= (self.loc.exp() - (-self.loc).exp())
+        # b = b.abs() + self.eps
+        # if self.train_shape or self.shape_init != '1':
+        #     b = (b ** self.shape)
+        # if self.train_scale or self.scale_init != '1':
+        #     b *= self.scale.exp()
+        # return -b
+        b = b - (self.loc.exp() - (-self.loc).exp())
+        return -((b.abs() + self.eps) ** self.shape) * self.scale.exp() 
     
 
 def get_slopes(n):
