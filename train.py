@@ -370,6 +370,9 @@ if __name__ == "__main__":
                 val_loss = val_loss.item()
             # log to console and to file
             monitor0.log_val(step, val_loss)
+            if not val_loss == val_loss:
+                print0("NaN Loss, Stop Training")
+                break
 
         # once in a while perform model inference on the master process
         if (args.sample_every > 0 \
