@@ -234,7 +234,7 @@ if __name__ == "__main__":
         "l6":  ModelArgs(dim=512,  n_layers=6,  n_heads=16, ffn_dim_multiplier=2),
         "l8":  ModelArgs(dim=768,  n_layers=8,  n_heads=16, ffn_dim_multiplier=2),
         "l12": ModelArgs(dim=768,  n_layers=12, n_heads=16, ffn_dim_multiplier=2),
-        "l16": ModelArgs(dim=1024, n_layers=16, n_heads=32, ffn_dim_multiplier=2),
+        "l15": ModelArgs(dim=1152, n_layers=15, n_heads=24, ffn_dim_multiplier=2),
         "l18": ModelArgs(dim=1536, n_layers=18, n_heads=32, ffn_dim_multiplier=2),
         "l24": ModelArgs(dim=2048, n_layers=24, n_heads=64, ffn_dim_multiplier=2),
     }[args.model_size]
@@ -487,8 +487,14 @@ if __name__ == "__main__":
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
                 val_loss += loss.item()
             val_loss /= len(val_dataset)
+            if ddp:
+                val_loss = torch.tensor(val_loss).to(device)
+                dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+                val_loss /= ddp_world_size
+                val_loss = val_loss.item()
         # log to console and to file
         monitor0.log_val(step+1, val_loss)
+    monitor0.check_save()
 
 
     # -------------------------------------------------------------------------
