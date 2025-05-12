@@ -274,36 +274,18 @@ class Evaluator:
                  passkey_sample_size=20,
                  passkey_pred_digits=5,
                  passkey_preffix_digits=0,
-                 passkey_samplings=['equidistant', 'beginning'],
+                 passkey_samplings=['equidistant'],
                  passkey_patience=float('inf'),
-                #  perplexity_dataset_dir='wikipedia',
-                #  perplexity_dataset_dir='10B',
-                 perplexity_dataset_dirs=['10B', 'wikipedia'],
-                 perplexity_seq_len=102_400,
+                 perplexity_dataset_dirs=['10B_', 'wikipedia'],
+                #  perplexity_seq_len=102_400,
+                 perplexity_seq_len=32_768,
                  perplexity_ntokens=3_932_160,
-                 perplexity_window_size=512,
-                #  perplexity_wiki_articles=64,
-                 perplexity_wiki_articles=64,
-                 seq_batch_size=1024,
+                 perplexity_window_size=1024,
+                 perplexity_wiki_articles=256,
+                 seq_batch_size=512,
                  device='cpu',
                  ):
-        # self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000] 
-        # self.passkey_seq_lens = passkey_seq_lens or [0, 128, 256, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360, 16384, 17408, 18432, 19456, 20480, 21504, 22528, 23552, 24576, 25600, 26624, 27648, 28672, 29696, 30720, 31744, 32768]
         self.passkey_seq_lens = passkey_seq_lens or [0, 128, 256, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 14336, 16384, 18432, 20480, 22528, 24576, 26624, 28672, 30720, 32768]
-        # self.passkey_seq_lens = passkey_seq_lens or [0, 128, 256, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 20480, 24576, 28672, 32768]
-
-        # self.passkey_seq_lens = passkey_seq_lens or [0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000, 
-        #                                              20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000, 90_000, 100_000, 
-        #                                              200_000, 300_000, 400_000, 500_000]
-        # self.passkey_evaluator = PasskeyEvaluator(
-        #     seq_lens=self.passkey_seq_lens,
-        #     device=device,
-        #     pred_digits=passkey_pred_digits,
-        #     preffix_digits=passkey_preffix_digits,
-        #     sampling=passkey_samplings[0],
-        #     patience=passkey_patience,
-        #     sample_size=passkey_sample_size,
-        # )
         self.passkey_evaluators = []
         for sampling in passkey_samplings:
             self.passkey_evaluators.append(PasskeyEvaluator(
