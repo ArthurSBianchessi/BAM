@@ -80,10 +80,9 @@ class AttentionPrior(nn.Module):
         q_positions = torch.arange(seq_len, device=self.scale.device).float() + start_pos
         k_positions = torch.arange(seq_len+start_pos, device=self.scale.device).float()
 
-        dist_matrix = (k_positions[None,:] - q_positions[:, None]).reshape(1, 1, seq_len, seq_len+start_pos)
-        loc = self.loc.exp() - (-self.loc).exp()
-        z = (dist_matrix - loc) * self.scale.exp()
-        return -((z.abs()+self.eps)**self.shape )
+        b = (k_positions[None,:] - q_positions[:, None]).reshape(1, 1, seq_len, seq_len+start_pos)
+        b = b - (self.loc.exp() - (-self.loc).exp())
+        return -((b.abs() + self.eps) ** self.shape) * self.scale.exp() 
     
 
 def get_slopes(n):
@@ -133,8 +132,8 @@ class BayesianAttention(nn.Module):
         seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
         self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
 
-        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
-        self.cache_k = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((1, 512*1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((1, 512*1024, self.n_local_kv_heads, self.head_dim))
         
 
     def forward(

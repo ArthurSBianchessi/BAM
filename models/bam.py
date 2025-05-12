@@ -102,12 +102,15 @@ class AttentionPrior(nn.Module):
         # positions = torch.arange(seq_len).float().to(self.scale.device)
         seq_len = seq_len or self.seq_len
         positions = torch.arange(seq_len, device=self.scale.device).float()
-        dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
+        # dist_matrix = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
         # return -(dist_matrix.abs() * self.scale).abs()
         # return -(dist_matrix * self.scale + self.loc).abs()
-        loc = self.loc.exp() - (-self.loc).exp()
-        z = (dist_matrix - loc) * self.scale.exp()
-        return -((z.abs()+self.eps)**self.shape )
+        # loc = self.loc.exp() - (-self.loc).exp()
+        # z = (dist_matrix - loc) * self.scale.exp()
+        # return -((z.abs()+self.eps)**self.shape )
+        b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
+        b = b - (self.loc.exp() - (-self.loc).exp())
+        return -((b.abs() + self.eps) ** self.shape) * self.scale.exp() 
     
 
 def get_slopes(n):
