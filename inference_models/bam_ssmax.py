@@ -173,7 +173,7 @@ class BayesianAttention(nn.Module):
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if section_log_len is not None and not self.ssmax_prior:
-            scores = (scores * section_log_len) * self.seq_scale
+            scores = scores * (section_log_len * self.seq_scale)
 
         if self.local_positional_encoding:
             scores = scores + self.prior(seqlen, start_pos)
@@ -181,7 +181,7 @@ class BayesianAttention(nn.Module):
             scores = scores + global_prior
 
         if section_log_len is not None and self.ssmax_prior:
-            scores = (scores * section_log_len) * self.seq_scale
+            scores = scores * (section_log_len * self.seq_scale)
 
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
