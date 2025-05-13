@@ -452,8 +452,6 @@ if __name__ == "__main__":
         #     all_lrs.add(param_group['lr'])
         # print(all_lrs)
         
-        # log
-        monitor0.log(step, lossf, norm, compute_radam_lr(optimizer))
         
         # step the optimizer
         # if lossf == lossf: # check for NaN
@@ -471,7 +469,9 @@ if __name__ == "__main__":
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
-        
+
+        # log
+        monitor0.log(step, lossf, norm, compute_radam_lr(optimizer))
         
     monitor0.save_model()
     monitor0.max_memory()
