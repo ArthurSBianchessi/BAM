@@ -452,8 +452,12 @@ if __name__ == "__main__":
         #     all_lrs.add(param_group['lr'])
         # print(all_lrs)
         
+        # log
+        monitor0.log(step, lossf, norm, compute_radam_lr(optimizer))
+        
         # step the optimizer
-        if lossf == lossf: # check for NaN
+        # if lossf == lossf: # check for NaN
+        if lossf == lossf and norm == norm: # check for NaN
             optimizer.step()
         else:
             print0("NaN Loss, Stop Training")
@@ -468,9 +472,6 @@ if __name__ == "__main__":
         elif device == "cuda":
             torch.cuda.synchronize()
         
-        # log
-        # monitor0.log(step, lossf, norm, optimizer.param_groups[0]['lr'])
-        monitor0.log(step, lossf, norm, compute_radam_lr(optimizer))
         
     monitor0.save_model()
     monitor0.max_memory()
