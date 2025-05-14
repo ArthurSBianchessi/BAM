@@ -11,7 +11,7 @@ from torch import nn
 
 
 @dataclass
-class SinusoidalModelArgs:
+class SinusoidalSSMaxModelArgs:
     dim: int = 1024
     n_layers: int = 32
     n_heads: int = 32
@@ -53,7 +53,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
-    def __init__(self, args: SinusoidalModelArgs):
+    def __init__(self, args: SinusoidalSSMaxModelArgs):
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
@@ -138,7 +138,7 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: SinusoidalModelArgs):
+    def __init__(self, layer_id: int, args: SinusoidalSSMaxModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
@@ -166,8 +166,8 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class SinusoidalTransformer(nn.Module):
-    def __init__(self, params: SinusoidalModelArgs):
+class SinusoidalSSMaxTransformer(nn.Module):
+    def __init__(self, params: SinusoidalSSMaxModelArgs):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
