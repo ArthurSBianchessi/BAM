@@ -23,6 +23,8 @@ class ALiBiModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
+    seq_scale: bool = True
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -64,13 +66,18 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+        self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
+
+
         self.cache_k = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
+        self.cache_v = torch.zeros((1, 1024, self.n_local_kv_heads, self.head_dim))
 
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = 0,
     ):
         bsz, seqlen, _ = x.shape
@@ -97,10 +104,9 @@ class Attention(nn.Module):
 
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
-            1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = scores * (section_log_len * self.seq_scale)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
@@ -152,9 +158,10 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = 0,
     ):
-        h = x + self.attention(self.attention_norm(x), mask, start_pos)
+        h = x + self.attention(self.attention_norm(x), mask, section_log_len, start_pos)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -183,22 +190,23 @@ class ALiBiTransformer(nn.Module):
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, seq_batch_size: Optional[int] = None, return_logits: bool = False, return_device=None):
         return_device = return_device if return_device is not None else tokens.device
-
-        _bsz, seqlen = tokens.shape
+        _bsz, full_seqlen = tokens.shape
         full_h = self.tok_embeddings(tokens)
         full_output = []
 
         if seq_batch_size is None:
-            seq_batch_size = seqlen
-        for start_pos in range(0, seqlen, seq_batch_size):
-            h = full_h[:, start_pos:start_pos+seq_batch_size, :].contiguous()
-            # h = full_h[:, start_pos:start_pos+seq_batch_size, :]
+            seq_batch_size = full_seqlen
+
+        for start_pos in range(0, full_seqlen, seq_batch_size):
+            h = full_h[:, start_pos:start_pos+seq_batch_size, :]
             _bsz, seqlen, h_dim = h.shape
-            mask = None
+
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=1)
             if start_pos > 0:
                 mask = torch.hstack([torch.zeros((seqlen, start_pos), device=tokens.device), mask])
+
+            section_log_len = mask.isfinite().float().sum(-1, keepdim=True).log().unsqueeze(-3)
 
             q_positions = torch.arange(seqlen, device=self.slopes.device).float() + start_pos
             k_positions = torch.arange(seqlen+start_pos, device=self.slopes.device).float()
@@ -207,7 +215,7 @@ class ALiBiTransformer(nn.Module):
             mask = mask.type_as(h)
 
             for layer in self.layers:
-                h = layer(h, mask, start_pos)
+                h = layer(h, mask, section_log_len, start_pos)
             h = self.norm(h)
             output = self.output(h).float()
             if return_logits:

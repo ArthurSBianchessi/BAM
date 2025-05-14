@@ -24,6 +24,8 @@ class SinusoidalModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 1024
 
+    seq_scale: bool = True
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -65,10 +67,14 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+        self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
+
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
@@ -81,6 +87,8 @@ class Attention(nn.Module):
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if section_log_len is not None:
+            scores = scores * (section_log_len * self.seq_scale)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(queries)
@@ -132,8 +140,9 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor],
+        section_log_len: Optional[torch.Tensor] = None,
     ):
-        h = x + self.attention(self.attention_norm(x), mask)
+        h = x + self.attention(self.attention_norm(x), mask, section_log_len)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -155,8 +164,6 @@ class SinusoidalTransformer(nn.Module):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.position_embeddings = self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta).unsqueeze(0)
-        # self.register_buffer("position_embeddings", 
-        #     self.sinusoidal_position_embeddings(params.max_seq_len, params.dim, params.sinusoidal_theta))
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
@@ -179,11 +186,15 @@ class SinusoidalTransformer(nn.Module):
                 section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
                 mask[section_mask] = float("-inf")
                 mask = mask.unsqueeze(-3)
-                
+
+                section_log_len = torch.tril(~section_mask, diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
+            else:
+                section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
+
             mask = mask.type_as(h)
 
         for layer in self.layers:
-            h = layer(h, mask)
+            h = layer(h, mask, section_log_len)
         h = self.norm(h)
         output = self.output(h).float()
         return output
