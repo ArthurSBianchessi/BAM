@@ -42,14 +42,15 @@ import torch.distributed as dist
 ########################################################################################
 # from models.model import Transformer, ModelArgs
 from models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
+from models.sinusoidal_ssmax import SinusoidalSSMaxModelArgs, SinusoidalSSMaxTransformer
 from models.rotary import RotaryModelArgs, RotaryTransformer
 from models.rotary_ssmax import RotarySSMaxModelArgs, RotarySSMaxTransformer
 from models.alibi import ALiBiModelArgs, ALiBiTransformer
+from models.alibi_ssmax import ALiBiSSMaxModelArgs, ALiBiSSMaxTransformer
 from models.bam import BATransformer, BATModelArgs
 from models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
-from models.laplace import LaplaceTransformer, LaplaceModelArgs
-from models.laplace_ssmax import LaplaceSSMaxTransformer, LaplaceSSMaxModelArgs
 from models.nope import NoPEModelArgs, NoPETransformer
+from models.nope_ssmax import NoPESSMaxModelArgs, NoPESSMaxTransformer
 
 from utils import print0, round_to_multiple, set_lr, compute_radam_lr, DistributedShardedDataset, StateMonitor
 ########################################################################################
@@ -128,8 +129,9 @@ if __name__ == "__main__":
     # args error checking and convenience variables
     batch_size, seq_len = args.batch_size, args.sequence_length
     assert args.dtype in {"float32", "float16", "bfloat16"}
-    assert args.model_size in {"l6", "l8", "l12", "l16", "l18", "l24", "l32"}
-    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "alibi", "bam", "bam_ssmax", "laplace", "laplace_ssmax", "nope"}
+    assert args.model_size in {"l6", "l8", "l12", "l15", "l16", "l18", "l24", "l32"}
+    assert args.position_encoding in {"rotary", "rotary_ssmax", "sinusoidal", "sinusoidal_ssmax", 
+                                      "alibi", "alibi_ssmax", "bam", "bam_ssmax", "nope", "nope_ssmax"}
     # assert only one of min_tokens_per_step, tokens_per_step, max_tokens_per_step is set
     assert sum([args.min_tokens_per_step is not None, 
                 args.tokens_per_step is not None, 
@@ -218,15 +220,16 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     ModelArgs, Transformer = {
-        "rotary":       (RotaryModelArgs,       RotaryTransformer       ),
-        "rotary_ssmax": (RotarySSMaxModelArgs,  RotarySSMaxTransformer  ),
-        "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
-        "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
-        "bam":          (BATModelArgs,          BATransformer           ),
-        "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
-        "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
-        "laplace_ssmax":(LaplaceSSMaxModelArgs, LaplaceSSMaxTransformer ),
-        "nope":         (NoPEModelArgs,         NoPETransformer         ),
+        "sinusoidal":       (SinusoidalModelArgs,   SinusoidalTransformer        ),
+        "sinusoidal_ssmax": (SinusoidalSSMaxModelArgs, SinusoidalSSMaxTransformer),
+        "rotary":           (RotaryModelArgs,       RotaryTransformer            ),
+        "rotary_ssmax":     (RotarySSMaxModelArgs,  RotarySSMaxTransformer       ),
+        "alibi":            (ALiBiModelArgs,        ALiBiTransformer             ),
+        "alibi_ssmax":      (ALiBiSSMaxModelArgs,   ALiBiSSMaxTransformer        ),
+        "bam":              (BATModelArgs,          BATransformer                ),
+        "bam_ssmax":        (SSMaxBATModelArgs,     SSMaxBATransformer           ),
+        "nope":             (NoPEModelArgs,         NoPETransformer              ),
+        "nope_ssmax":       (NoPESSMaxModelArgs,    NoPESSMaxTransformer         ),
     }[args.position_encoding]
 
     # init the model
@@ -451,7 +454,7 @@ if __name__ == "__main__":
         #     # print(param_group['lr'], end='\t')
         #     all_lrs.add(param_group['lr'])
         # print(all_lrs)
-        
+
         
         # step the optimizer
         # if lossf == lossf: # check for NaN
@@ -495,7 +498,6 @@ if __name__ == "__main__":
                 val_loss = val_loss.item()
         # log to console and to file
         monitor0.log_val(step+1, val_loss)
-    monitor0.check_save()
 
 
     # -------------------------------------------------------------------------
