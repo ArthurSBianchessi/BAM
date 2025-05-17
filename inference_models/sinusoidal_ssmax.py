@@ -189,10 +189,10 @@ class SinusoidalSSMaxTransformer(nn.Module):
         return_device = return_device if return_device is not None else tokens.device
         _bsz, full_seqlen = tokens.shape
         full_h = self.tok_embeddings(tokens)
-        if seqlen <= self.position_embeddings.shape[1]:
-            full_h = full_h + self.position_embeddings[:, :seqlen].to(full_h.device)
+        if full_seqlen <= self.position_embeddings.shape[1]:
+            full_h = full_h + self.position_embeddings[:, :full_seqlen].to(full_h.device)
         else:
-            position_embeddings = self.sinusoidal_position_embeddings(seqlen, self.params.dim, self.params.sinusoidal_theta)
+            position_embeddings = self.sinusoidal_position_embeddings(full_seqlen, self.params.dim, self.params.sinusoidal_theta)
             position_embeddings = position_embeddings.unsqueeze(0).to(full_h.device)
             full_h = full_h + position_embeddings
 
