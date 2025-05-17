@@ -8,15 +8,16 @@ from datasets import load_dataset
 from time import time
 
 from inference_models.sinusoidal import SinusoidalModelArgs, SinusoidalTransformer
+from inference_models.sinusoidal_ssmax import SinusoidalSSMaxModelArgs, SinusoidalSSMaxTransformer
+from inference_models.rotary import RotaryModelArgs, RotaryTransformer
 from inference_models.rotary_local import LocalRotaryTransformer, LocalRotaryModelArgs
 from inference_models.rotary_ssmax import RotarySSMaxModelArgs, RotarySSMaxTransformer
-from inference_models.rotary import RotaryTransformer, RotaryModelArgs
 from inference_models.alibi import ALiBiModelArgs, ALiBiTransformer
-from inference_models.bam_uninterpretable import BATransformer0, BATModelArgs0
-from inference_models.bam import BATransformer, BATModelArgs 
+from inference_models.alibi_ssmax import ALiBiSSMaxModelArgs, ALiBiSSMaxTransformer
+from inference_models.bam import BATransformer, BATModelArgs
 from inference_models.bam_ssmax import SSMaxBATransformer, SSMaxBATModelArgs
-from inference_models.laplace import LaplaceTransformer, LaplaceModelArgs
 from inference_models.nope import NoPEModelArgs, NoPETransformer
+from inference_models.nope_ssmax import NoPESSMaxModelArgs, NoPESSMaxTransformer
 
 
 
@@ -65,7 +66,8 @@ class PasskeyEvaluator:
                 if (list(pred_pass_key) == pass_key[self.preffix_digits+1:]):
                     correct += 1
                 end = time()
-                print(f"                seq_len: {len(prompt)}, acc: {correct}/{i+1} of {self.sample_size} took {(end-start)/(i+1):.2f}s", end='\r')
+                print(f"                seq_len: {len(prompt)}, acc: {correct}/{i+1} of {self.sample_size} took {(end-start)/(i+1):.2f}s              {self.generator.tokenizer.decode(output[0,-1].cpu())}")
+                # print(f"                seq_len: {len(prompt)}, acc: {correct}/{i+1} of {self.sample_size} took {(end-start)/(i+1):.2f}s", end='\r')
             results[result_config]['seq_lens'].append(seq_len)
             results[result_config]['accs'].append(correct/self.sample_size)
             if verbose:
@@ -142,6 +144,10 @@ class PromptGenerator:
             passkey_positions = random.choices(range(n_garbage+1), k=sample_size)
         elif sampling == 'equidistant':
             passkey_positions = torch.linspace(0, n_garbage, sample_size).long().tolist()
+            # print('Start at 2')
+            # passkey_positions = torch.linspace(0, n_garbage, sample_size).long().tolist()[2:]
+            print('REVERSED')
+            passkey_positions = torch.linspace(0, n_garbage, sample_size).long().tolist()[::-1]
         elif sampling == 'beginning':
             passkey_positions = [0] * sample_size
         elif sampling == 'end':
@@ -241,7 +247,8 @@ class PerplexityEvaluator:
         entropies_sqrd = torch.zeros(self.nwindows)
         for i, tokens in enumerate(self.tokens):
             # tokens = tokens.to(self.device)
-            print(f'{i+1}/{len(self.tokens)}   {entropies.sum()}', end='\r')
+            print(f'{i+1}/{len(self.tokens)}   {(entropies.mean()/(i+1)).exp()}')
+            # print(f'{i+1}/{len(self.tokens)}   {(entropies.mean()/(i+1)).exp()}', end='\r')
             # output = model(tokens.unsqueeze(0).to(self.device)).cpu()
             # loss = self.cross_entropy(output[0, :, :], self.targets[i]).reshape(-1, self.window_size)
             output = model(tokens.unsqueeze(0).to(self.device), seq_batch_size=self.seq_batch_size, return_logits=True, return_device='cpu')
@@ -276,7 +283,7 @@ class Evaluator:
                  passkey_preffix_digits=0,
                  passkey_samplings=['equidistant'],
                  passkey_patience=float('inf'),
-                 perplexity_dataset_dirs=['10B_', 'wikipedia'],
+                 perplexity_dataset_dirs=['10B', 'wikipedia'],
                 #  perplexity_seq_len=102_400,
                  perplexity_seq_len=32_768,
                  perplexity_ntokens=3_932_160,
@@ -356,12 +363,13 @@ class Evaluator:
             "rotary_local": (LocalRotaryModelArgs,  LocalRotaryTransformer  ),
             "rotary_ssmax": (RotarySSMaxModelArgs,  RotarySSMaxTransformer  ),
             "sinusoidal":   (SinusoidalModelArgs,   SinusoidalTransformer   ),
+            "sinusoidal_ssmax": (SinusoidalSSMaxModelArgs, SinusoidalSSMaxTransformer),
             "alibi":        (ALiBiModelArgs,        ALiBiTransformer        ),
+            "alibi_ssmax":  (ALiBiSSMaxModelArgs,   ALiBiSSMaxTransformer   ),
             "bam":          (BATModelArgs,          BATransformer           ),
             "bam_ssmax":    (SSMaxBATModelArgs,     SSMaxBATransformer      ),
-            "laplace":      (LaplaceModelArgs,      LaplaceTransformer      ),
             "nope":         (NoPEModelArgs,         NoPETransformer         ),
-            "bam_uninterpretable": (BATModelArgs0, BATransformer0),
+            "nope_ssmax":   (NoPESSMaxModelArgs,    NoPESSMaxTransformer    ),
         }[args['args']['position_encoding']]
         # model_dict = torch.load(dir+f'model{comp}.pt')
         model_dict = torch.load(os.path.join(dir, f'model.pt'))
