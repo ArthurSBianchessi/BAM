@@ -3,8 +3,10 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_block_mask
 
 
 @dataclass
@@ -53,22 +55,22 @@ class AttentionPrior(nn.Module):
 
         
         if args.theta_alpha_init == 'slope':
-            theta_alpha = torch.tensor(get_slopes(args.n_heads), dtype=torch.float).reshape(1, args.n_heads, 1, 1)
+            theta_alpha = torch.tensor(get_slopes(args.n_heads), dtype=torch.float).reshape(args.n_heads, 1)
         elif args.theta_alpha_init == 'sampled':
-            theta_alpha = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float).exp()
+            theta_alpha = torch.randn((args.n_heads, 1), dtype=torch.float).exp()
         else:
-            theta_alpha = torch.full((1, args.n_heads, 1, 1), float(args.theta_alpha_init), dtype=torch.float)
+            theta_alpha = torch.full((args.n_heads, 1), float(args.theta_alpha_init), dtype=torch.float)
         
         if args.train_theta_beta and args.thata_beta_init == 'linear':
-            theta_beta  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
+            theta_beta  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(args.n_heads, 1)
         elif args.train_theta_beta and args.thata_beta_init == 'sampled':
-            theta_beta  = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float)
+            theta_beta  = torch.randn((args.n_heads, 1), dtype=torch.float)
         elif args.train_theta_beta:
-            theta_beta   = torch.full((1, args.n_heads, 1, 1), float(args.thata_beta_init), dtype=torch.float)
+            theta_beta   = torch.full((args.n_heads, 1), float(args.thata_beta_init), dtype=torch.float)
         else:
-            theta_beta   = torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+            theta_beta   = torch.ones((args.n_heads, 1), dtype=torch.float)
 
-        theta_mu = torch.full((1, args.n_heads, 1, 1), float(args.theta_mu_init),   dtype=torch.float)
+        theta_mu = torch.full((args.n_heads, 1), float(args.theta_mu_init),   dtype=torch.float)
         
         self.theta_beta  = nn.Parameter(theta_beta, requires_grad = args.train_theta_beta)
         self.theta_alpha = nn.Parameter(theta_alpha, requires_grad = args.train_theta_alpha)
@@ -77,8 +79,9 @@ class AttentionPrior(nn.Module):
     def forward(self, seq_len=None):
         seq_len = seq_len or self.seq_len
         positions = torch.arange(seq_len, device=self.theta_alpha.device).float()
-        b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
-        b = b - (self.theta_mu.exp() - (-self.theta_mu).exp())
+        positions = torch.arange(1-seq_len, seq_len, device=self.theta_alpha.device).float()
+        # b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
+        b = positions - (self.theta_mu.exp() - (-self.theta_mu).exp())
         return -((b.abs() + self.eps) ** self.theta_beta) * self.theta_alpha.exp() 
     
 
@@ -125,7 +128,7 @@ class BayesianAttention(nn.Module):
         if self.local_positional_encoding:
             self.prior = AttentionPrior(args)
 
-        seq_scale =  torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+        seq_scale =  torch.ones((args.n_heads, 1), dtype=torch.float)
         self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
 
     def forward(
@@ -145,20 +148,26 @@ class BayesianAttention(nn.Module):
         queries = queries.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(queries, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if self.local_positional_encoding:
-            scores = scores + self.prior(seqlen)
-        else:
-            scores = scores + gloabal_prior
+        ssmax_mul = section_log_len * self.seq_scale
+        prior = self.prior(seqlen) if self.local_positional_encoding else gloabal_prior
+        def score_mod(score, b, h, q_idx, kv_idx):
+            score = score + prior[h, seqlen-1+kv_idx-q_idx]
+            return score * ssmax_mul[h, q_idx]
 
-        scores = scores * (section_log_len * self.seq_scale)
+        
 
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        output = flex_attention(queries, keys, values, score_mod=score_mod, block_mask=mask,
+                                kernel_options = {
+                                    "BLOCK_M":  32,
+                                    "BLOCK_N":  32,
+                                    "BLOCK_M1": 32,
+                                    "BLOCK_N1": 32,
+                                    "BLOCK_M2": 32,
+                                    "BLOCK_N2": 32,
+                                }
+                                )
 
-        scores = F.softmax(scores.float(), dim=-1).type_as(queries)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -239,26 +248,15 @@ class SSMaxBATransformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
-            mask = torch.triu(mask, diagonal=1)
-
-            if seq_codes is not None:
-                mask = mask.unsqueeze(0).repeat(_bsz, 1, 1)
-                section_mask = seq_codes.unsqueeze(-1) != seq_codes.unsqueeze(-2)
-                mask[section_mask] = float("-inf")
-                mask = mask.unsqueeze(-3)
-
-                section_log_len = torch.tril(~section_mask, diagonal=0).sum(-1, keepdim=True).log().unsqueeze(-3)
-            else:
-                section_log_len = torch.tril(torch.ones((1,1,seqlen,seqlen)), diagonal=0).sum(-1, keepdim=True).log().to(tokens.device)
-
+            section_log_len = torch.arange(1, seqlen+1).log().unsqueeze(0).to(tokens.device)
+            def causal(b, h, q_idx, kv_idx):
+                return q_idx >= kv_idx
+            mask = create_block_mask(causal, B=None, H=None, Q_LEN=seqlen, KV_LEN=seqlen, device=tokens.device)
 
             global_prior = None
             if self.global_positional_encoding:
                 global_prior = self.prior(seqlen)
 
-            mask = mask.type_as(h)
 
         for layer in self.layers:
             h = layer(h, mask, global_prior, section_log_len)
