@@ -78,9 +78,7 @@ class AttentionPrior(nn.Module):
 
     def forward(self, seq_len=None):
         seq_len = seq_len or self.seq_len
-        positions = torch.arange(seq_len, device=self.theta_alpha.device).float()
         positions = torch.arange(1-seq_len, seq_len, device=self.theta_alpha.device).float()
-        # b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
         b = positions - (self.theta_mu.exp() - (-self.theta_mu).exp())
         return -((b.abs() + self.eps) ** self.theta_beta) * self.theta_alpha.exp() 
     
@@ -128,7 +126,7 @@ class BayesianAttention(nn.Module):
         if self.local_positional_encoding:
             self.prior = AttentionPrior(args)
 
-        seq_scale =  torch.ones((args.n_heads, 1), dtype=torch.float)
+        seq_scale =  torch.ones((1, args.n_heads, 1), dtype=torch.float)
         self.seq_scale = nn.Parameter(seq_scale, requires_grad=args.seq_scale)
 
     def forward(
@@ -139,6 +137,10 @@ class BayesianAttention(nn.Module):
         section_log_len: Optional[torch.Tensor] = None,
     ):
         bsz, seqlen, _ = x.shape
+
+        ssmax_mul = section_log_len * self.seq_scale
+        prior = self.prior(seqlen) if self.local_positional_encoding else gloabal_prior
+
         queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
 
         queries = queries.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -149,11 +151,11 @@ class BayesianAttention(nn.Module):
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
 
-        ssmax_mul = section_log_len * self.seq_scale
-        prior = self.prior(seqlen) if self.local_positional_encoding else gloabal_prior
+        # ssmax_mul = section_log_len * self.seq_scale
+        # prior = self.prior(seqlen) if self.local_positional_encoding else gloabal_prior
         def score_mod(score, b, h, q_idx, kv_idx):
             score = score + prior[h, seqlen-1+kv_idx-q_idx]
-            return score * ssmax_mul[h, q_idx]
+            return score * ssmax_mul[b, h, q_idx]
 
         
 
@@ -243,19 +245,23 @@ class SSMaxBATransformer(nn.Module):
             self.prior = AttentionPrior(params)
 
     def forward(self, tokens: torch.Tensor, seq_codes: Optional[torch.Tensor] = None):
-        _bsz, seqlen = tokens.shape
+        bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
-        mask = None
-        if seqlen > 1:
-            section_log_len = torch.arange(1, seqlen+1).log().unsqueeze(0).to(tokens.device)
-            def causal(b, h, q_idx, kv_idx):
-                return q_idx >= kv_idx
-            mask = create_block_mask(causal, B=None, H=None, Q_LEN=seqlen, KV_LEN=seqlen, device=tokens.device)
+        if seq_codes is not None:
+            section_log_len = torch.tril((seq_codes.unsqueeze(-1) == seq_codes.unsqueeze(-2))).sum(-1).log().unsqueeze(1)
+        else:
+            section_log_len = torch.arange(1, seqlen+1).log().unsqueeze(0).unsqueeze(0).to(tokens.device).repeat(bsz, 1, 1)
 
-            global_prior = None
-            if self.global_positional_encoding:
-                global_prior = self.prior(seqlen)
+        def mask_mod(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            seq_mask = seq_codes[b, q_idx] == seq_codes[b, kv_idx]
+            return causal_mask & seq_mask
+        mask = create_block_mask(mask_mod, B=bsz, H=None, Q_LEN=seqlen, KV_LEN=seqlen, device=tokens.device, BLOCK_SIZE=128)
+
+        global_prior = None
+        if self.global_positional_encoding:
+            global_prior = self.prior(seqlen)
 
 
         for layer in self.layers:
