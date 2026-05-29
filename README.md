@@ -1,50 +1,80 @@
 # Bayesian Attention Mechanism
-This repository contains the implementation of the Bayesian Attention Mechanism (BAM) as described in the paper ["Bayesian Attention Mechanism: A Probabilistic Framework for Positional Encoding and Context Length Extrapolation"](https://arxiv.org/abs/2505.22842) by Arthur S. Bianchessi, Rodrigo C. Barros and Lucas S. Kupssinsku. The training code was adapted from [llm.c](https://github.com/karpathy/llm.c), and we used [llama 3](https://github.com/meta-llama/llama-models/blob/main/models/llama3/model.py) as a template for our models.
 
-# Installation
+<p align="center">
+  <a href="https://openreview.net/forum?id=dXJB9O8fLd"><img src="https://img.shields.io/badge/Paper-OpenReview-blue" alt="OpenReview"></a>
+  <a href="https://arxiv.org/abs/2505.22842"><img src="https://img.shields.io/badge/arXiv-2505.22842-b31b1b?logo=arxiv&logoColor=white" alt="arXiv"></a>
+  <a href="https://iclr.cc/virtual/2026/poster/10008400"><img src="https://img.shields.io/badge/ICLR-2026-8b5cf6" alt="ICLR 2026"></a>
+  <a href="assets/poster.pdf"><img src="https://img.shields.io/badge/Poster-PDF-green" alt="Poster"></a>
+  <a href="assets/slides.pdf"><img src="https://img.shields.io/badge/Slides-PDF-orange" alt="Slides"></a>
+</p>
+
+This repository contains the implementation of the Bayesian Attention Mechanism (BAM) as described in the paper "Bayesian Attention Mechanism: A Probabilistic Framework for Positional Encoding and Context Length Extrapolation" by Arthur S. Bianchessi, Yasmin Aguirre, Rodrigo C. Barros and Lucas S. Kupssinsku, published at ICLR 2026. The training code was adapted from [llm.c](https://github.com/karpathy/llm.c), and we used [llama 3](https://github.com/meta-llama/llama-models/blob/main/models/llama3/model.py) as a template for our models.
+
+[![BAM poster (ICLR 2026)](assets/poster.png)](assets/poster.pdf)
+
+## Highlights
+BAM reframes positional encoding as a prior in a probabilistic attention model, unifying methods such as NoPE and ALiBi and motivating a Generalized Gaussian positional prior. Empirically, BAM:
+
+- retrieves information accurately at up to **500×** the training context length,
+- improves over the previous state of the art in context-length generalization by more than **25×** in retrieval accuracy,
+- while maintaining comparable perplexity and adding **minimal extra parameters**.
+
+## Installation
 To install the required dependencies, run the following command:
 
 ```bash
 pip install -r requirements.txt
 ```
-# Usage
+
+## Usage
 To train the BAM model, first prepare your dataset with the following command:
 
 ```bash
 python dataset.py
 ```
 
-This should create a tokenized dataset file in the `data/`, of the [FineWeb 10B token sample](https://huggingface.co/datasets/HuggingFaceFW/fineweb) using [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) tokenizer. If you want to use larger datasets `--streaming` option can be used to stream the dataset from Hugging Face.
-To train the BAM model as described in the paper, run the following command adapting to your hardware configuration: 
+This creates a tokenized dataset file in `data/`, from the [FineWeb 10B token sample](https://huggingface.co/datasets/HuggingFaceFW/fineweb) using the [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) tokenizer. If you want to use larger datasets, the `--streaming` option can be used to stream the dataset from Hugging Face.
+
+To train the BAM model as described in the paper, run the following command, adapting `--nproc_per_node` and `--batch_size` to your hardware (the two combined with `--tokens_per_step` determine the gradient-accumulation steps):
 
 ```bash
 time torchrun --standalone --nproc_per_node '<customize>' \
     train.py \
+        --num_iterations=20000 \
         --tokens_per_step=589824 \
         --position_encoding=bam_ssmax \
         --model_size=l12 \
         --sequence_length=512 \
         --batch_size='<customize>' \
-        --weight_decay=0.1  \
+        --weight_decay=0.1 \
         --learning_rate_decay_frac=0.1 \
         --compile \
         --tensorcores \
         --val_loss_every=32 \
         --dtype=bfloat16 \
-        --learning_rate 1e-3 \
+        --learning_rate=1e-3
 ```
 
-# Evaluation
-To evaluate the BAM model, you can use the following command:
+`--num_iterations` is required. At `--tokens_per_step=589824`, roughly 20,000 iterations correspond to a single epoch over the FineWeb 10B sample.
+
+### Options
+The same script reproduces every model in the paper by varying two flags:
+
+- `--position_encoding`: `nope`, `nope_ssmax`, `sinusoidal`, `sinusoidal_ssmax`, `rotary`, `rotary_ssmax`, `alibi`, `alibi_ssmax`, `bam`, `bam_ssmax`
+- `--model_size`: `l6`, `l8`, `l12`, `l15`, `l18`, `l24`
+
+BAM-specific knobs (`--theta_alpha_init`, `--thata_beta_init`, `--theta_mu_init`, `--global_prior`, `--prior_lr`, …) are documented via `python train.py --help`.
+
+## Evaluation
+To evaluate a trained model, run:
 
 ```bash
-python evaluate.py --log_dir '<path_to_your_model_log_dir>' 
+python evaluate.py --log_dir '<path_to_your_model_log_dir>'
 ```
-Considering a single run of the training example above, the log directory would be `logs/l12/bam_ssmax/version_00`.
 
+This runs the passkey-retrieval task across context lengths up to 32,768 tokens (the context-length extrapolation experiment from the paper). Add `--perplexity` to also report perplexity on Wikipedia articles. Considering a single run of the training example above, the log directory would be `logs/l12/bam_ssmax/version_00`.
 
-
-# Implementation Details
+## Implementation Details
 
 The Bayesian Attention Mechanism (BAM) model is implemented in the `models/bam.py` and `models/bam_ssmax.py` files. The models use the following class implementations to generate biases for the attention mechanism:
 
@@ -86,4 +116,19 @@ class AttentionPrior(nn.Module):
         b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
         b = b - (self.theta_mu.exp() - (-self.theta_mu).exp())
         return -((b.abs() + self.eps) ** self.theta_beta) * self.theta_alpha.exp()  
+```
+
+## Citation
+If you use this code or the Bayesian Attention Mechanism in your research, please cite:
+
+```bibtex
+@inproceedings{bianchessi2026bayesian,
+  title     = {Bayesian Attention Mechanism: A Probabilistic Framework for Positional Encoding and Context Length Extrapolation},
+  author    = {Bianchessi, Arthur S. and Aguirre, Yasmin and Barros, Rodrigo C. and Kupssinsk{\"u}, Lucas S.},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=dXJB9O8fLd},
+  eprint    = {2505.22842},
+  archivePrefix = {arXiv}
+}
 ```
