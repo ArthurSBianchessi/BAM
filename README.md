@@ -13,11 +13,11 @@ This repository contains the implementation of the Bayesian Attention Mechanism 
 [![BAM poster (ICLR 2026)](assets/poster.png)](assets/poster.pdf)
 
 ## Highlights
-BAM reframes positional encoding as a prior in a probabilistic attention model, unifying methods such as NoPE and ALiBi and motivating a Generalized Gaussian positional prior. Empirically, BAM:
+BAM reframes positional encoding as a prior in a probabilistic attention model, unifying methods such as NoPE and ALiBi under a single framework and motivating a Generalized Gaussian positional prior. Empirically, BAM:
 
 - retrieves information accurately at up to **500×** the training context length,
 - improves over the previous state of the art in context-length generalization by more than **25×** in retrieval accuracy,
-- while maintaining comparable perplexity and adding **minimal extra parameters**.
+- maintains comparable perplexity while adding **minimal extra parameters** (two trained scalars per attention head).
 
 ## Installation
 To install the required dependencies, run the following command:
@@ -55,7 +55,7 @@ time torchrun --standalone --nproc_per_node '<customize>' \
         --learning_rate=1e-3
 ```
 
-`--num_iterations` is required. At `--tokens_per_step=589824`, roughly 20,000 iterations correspond to a single epoch over the FineWeb 10B sample.
+`--num_iterations` is required. At `--tokens_per_step=589824`, roughly 20,000 iterations correspond to a single epoch over the FineWeb 10B sample. Pick `--nproc_per_node` and `--batch_size` to fit your GPUs; gradient accumulation makes up the remainder of `--tokens_per_step` automatically.
 
 ### Options
 The same script reproduces every model in the paper by varying two flags:
@@ -63,7 +63,7 @@ The same script reproduces every model in the paper by varying two flags:
 - `--position_encoding`: `nope`, `nope_ssmax`, `sinusoidal`, `sinusoidal_ssmax`, `rotary`, `rotary_ssmax`, `alibi`, `alibi_ssmax`, `bam`, `bam_ssmax`
 - `--model_size`: `l6`, `l8`, `l12`, `l15`, `l18`, `l24`
 
-BAM-specific knobs (`--theta_alpha_init`, `--thata_beta_init`, `--theta_mu_init`, `--global_prior`, `--prior_lr`, …) are documented via `python train.py --help`.
+The `_ssmax` variants enable [Scalable-Softmax](https://arxiv.org/abs/2501.19399). BAM-specific knobs (`--theta_alpha_init`, `--thata_beta_init`, `--theta_mu_init`, `--global_prior`, `--prior_lr`, …) are documented via `python train.py --help`.
 
 ## Evaluation
 To evaluate a trained model, run:
@@ -76,7 +76,16 @@ This runs the passkey-retrieval task across context lengths up to 32,768 tokens 
 
 ## Implementation Details
 
-The Bayesian Attention Mechanism (BAM) model is implemented in the `models/bam.py` and `models/bam_ssmax.py` files. The models use the following class implementations to generate biases for the attention mechanism:
+The Bayesian Attention Mechanism is implemented in [`models/bam.py`](models/bam.py) and [`models/bam_ssmax.py`](models/bam_ssmax.py); baseline encodings (NoPE, sinusoidal, RoPE, ALiBi) live alongside them in [`models/`](models/) for direct comparison.
+
+The core of BAM is a per-head additive attention bias derived from a Generalized Gaussian positional prior:
+
+$$
+B_{ij} \;=\; -\,e^{\theta_\alpha}\,\bigl(\,\lvert (i - j) - \mu \rvert + \varepsilon\,\bigr)^{\theta_\beta},
+\qquad \mu = e^{\theta_\mu} - e^{-\theta_\mu},
+$$
+
+where $\theta_\alpha$ (log-scale) and $\theta_\beta$ (shape) are learned per attention head, while the offset $\theta_\mu$ is held fixed by default (enable with `--theta_mu_trainable=1`). The corresponding code is:
 
 ```python
 
