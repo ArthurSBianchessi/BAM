@@ -63,7 +63,9 @@ The same script reproduces every model in the paper by varying two flags:
 - `--position_encoding`: `nope`, `nope_ssmax`, `sinusoidal`, `sinusoidal_ssmax`, `rotary`, `rotary_ssmax`, `alibi`, `alibi_ssmax`, `bam`, `bam_ssmax`
 - `--model_size`: `l6`, `l8`, `l12`, `l15`, `l18`, `l24`
 
-The `_ssmax` variants enable [Scalable-Softmax](https://arxiv.org/abs/2501.19399). BAM-specific knobs (`--theta_alpha_init`, `--thata_beta_init`, `--theta_mu_init`, `--global_prior`, `--prior_lr`, …) are documented via `python train.py --help`.
+The `_ssmax` variants enable [Scalable-Softmax](https://arxiv.org/abs/2501.19399). BAM-specific knobs (`--theta_alpha_init`, `--thata_beta_init`, `--theta_mu_init`, `--global_prior`, `--prior_lr`, …) are documented via `python train.py --help`. Note that `--theta_mu_trainable` defaults to `0`, so BAM trains two scalars per head (`theta_alpha`, `theta_beta`) unless you enable the offset with `--theta_mu_trainable=1`.
+
+Each run writes checkpoints, configs, and metrics to `logs/<model_size>/<position_encoding>/version_NN/`. The full paper sweep is the Cartesian product of the two lists above (60 runs); each individual run uses the command shown earlier with the corresponding flag values.
 
 ## Evaluation
 To evaluate a trained model, run:
@@ -88,7 +90,6 @@ $$
 where $\theta_\alpha$ (log-scale) and $\theta_\beta$ (shape) are learned per attention head, while the offset $\theta_\mu$ is held fixed by default (enable with `--theta_mu_trainable=1`). The corresponding code is:
 
 ```python
-
 class AttentionPrior(nn.Module):
     def __init__(self, args: SSMaxBATModelArgs):
         super().__init__()
@@ -96,35 +97,54 @@ class AttentionPrior(nn.Module):
         self.n_heads = args.n_heads
         self.eps = 1e-5
 
-        
         if args.theta_alpha_init == 'slope':
             theta_alpha = torch.tensor(get_slopes(args.n_heads), dtype=torch.float).reshape(1, args.n_heads, 1, 1)
         elif args.theta_alpha_init == 'sampled':
             theta_alpha = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float).exp()
         else:
             theta_alpha = torch.full((1, args.n_heads, 1, 1), float(args.theta_alpha_init), dtype=torch.float)
-        
-        if args.train_theta_beta and args.thata_beta_init == 'linear':
-            theta_beta  = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
-        elif args.train_theta_beta and args.thata_beta_init == 'sampled':
-            theta_beta  = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float)
-        elif args.train_theta_beta:
-            theta_beta   = torch.full((1, args.n_heads, 1, 1), float(args.thata_beta_init), dtype=torch.float)
-        else:
-            theta_beta   = torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
 
-        theta_mu = torch.full((1, args.n_heads, 1, 1), float(args.theta_mu_init),   dtype=torch.float)
-        
-        self.theta_beta  = nn.Parameter(theta_beta, requires_grad = args.train_theta_beta)
-        self.theta_alpha = nn.Parameter(theta_alpha, requires_grad = args.train_theta_alpha)
-        self.theta_mu    = nn.Parameter(theta_mu,   requires_grad = args.train_theta_mu)
+        if args.train_theta_beta and args.thata_beta_init == 'linear':
+            theta_beta = torch.linspace(0, 1, args.n_heads, dtype=torch.float).reshape(1, args.n_heads, 1, 1)
+        elif args.train_theta_beta and args.thata_beta_init == 'sampled':
+            theta_beta = torch.randn((1, args.n_heads, 1, 1), dtype=torch.float)
+        elif args.train_theta_beta:
+            theta_beta = torch.full((1, args.n_heads, 1, 1), float(args.thata_beta_init), dtype=torch.float)
+        else:
+            theta_beta = torch.ones((1, args.n_heads, 1, 1), dtype=torch.float)
+
+        theta_mu = torch.full((1, args.n_heads, 1, 1), float(args.theta_mu_init), dtype=torch.float)
+
+        self.theta_alpha = nn.Parameter(theta_alpha, requires_grad=args.train_theta_alpha)
+        self.theta_beta  = nn.Parameter(theta_beta,  requires_grad=args.train_theta_beta)
+        self.theta_mu    = nn.Parameter(theta_mu,    requires_grad=args.train_theta_mu)
 
     def forward(self, seq_len=None):
         seq_len = seq_len or self.seq_len
         positions = torch.arange(seq_len, device=self.theta_alpha.device).float()
         b = (positions[None, :] - positions[:, None]).reshape(1, 1, seq_len, seq_len)
         b = b - (self.theta_mu.exp() - (-self.theta_mu).exp())
-        return -((b.abs() + self.eps) ** self.theta_beta) * self.theta_alpha.exp()  
+        return -((b.abs() + self.eps) ** self.theta_beta) * self.theta_alpha.exp()
+```
+
+## Repository Layout
+
+```
+BAM/
+├── train.py            # llm.c-derived training loop (DDP, gradient accumulation, bfloat16)
+├── evaluate.py         # passkey-retrieval + optional Wikipedia perplexity
+├── dataset.py          # tokenizes FineWeb 10B with the Mistral 7B tokenizer
+├── eval_utils.py       # passkey synthesis and scoring
+├── utils.py            # shared training/eval helpers
+├── requirements.txt
+├── models/             # one file per positional-encoding variant
+│   ├── bam.py          ├── bam_ssmax.py
+│   ├── alibi.py        ├── alibi_ssmax.py
+│   ├── rotary.py       ├── rotary_ssmax.py
+│   ├── sinusoidal.py   ├── sinusoidal_ssmax.py
+│   ├── nope.py         └── nope_ssmax.py
+├── assets/             # poster.{pdf,png}, slides.pdf
+└── logs/               # checkpoints and metrics, populated by train.py
 ```
 
 ## Citation
